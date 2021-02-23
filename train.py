@@ -1,6 +1,7 @@
 import torch
 import gym
-import matplotlib
+import matplotlib.pyplot as plt
+from matplotlib import animation
 import cv2
 import numpy as np
 import argparse
@@ -14,11 +15,32 @@ recording = {
     'episodes': []
 }
 
+"""
+Ensure you have imagemagick installed with 
+sudo apt-get install imagemagick
+
+Taken from https://gist.github.com/botforge/64cbb71780e6208172bbf03cd9293553
+"""
+def save_frames_as_gif(frames, path='./gifs', filename='gym_animation.gif'):
+    #Mess with this to change frame size
+    dpi = 72.
+    plt.figure(figsize=(frames[0].shape[1] / dpi, frames[0].shape[0] / dpi), dpi=dpi)
+
+    patch = plt.imshow(frames[0])
+    plt.axis('off')
+
+    def animate(i):
+        patch.set_data(frames[i])
+
+    anim = animation.FuncAnimation(plt.gcf(), animate, frames = len(frames), interval=50)
+    os.makedirs(path, exist_ok=True)
+    anim.save(os.path.join(path, filename), writer='imagemagick', fps=30)
+
 def step(env, action):
     obs, reward, done, info = env.step(action)
 
     if reward != 0:
-        print(f'step: {env.step}, reward: {reward}')
+        print(f'step: {info["step"]}, reward: {reward}')
 
     if should_record:
         step = (obs, action, reward, done)
@@ -53,6 +75,11 @@ if __name__ == '__main__':
         action='store_true'
     )
     parser.add_argument(
+        "--gifs",
+        help="how often to save a gif of agent completing an episode",
+        default=-1, # -1 is never
+    )
+    parser.add_argument(
         "--episodes",
         help="how many episodes to play",
         default=100,
@@ -62,6 +89,7 @@ if __name__ == '__main__':
     should_record = args.record
     env_name = args.env
     n_episodes = int(args.episodes)
+    gifs_frequency = int(args.gifs)
 
     env = gym.make(env_name)
     env = ImgObsWrapper(RGBImgPartialObsWrapper(env))
@@ -72,13 +100,16 @@ if __name__ == '__main__':
         for i_episode in range(n_episodes):
             obs = env.reset()
             recording['episodes'].append([])
+            frames = []
 
             while True:
-                env.render()
+                frames.append(env.render(mode='rgb_array'))
                 action = env.action_space.sample()
                 done = step(env, action)
                 
                 if done:
+                    if gifs_frequency > 0 and i_episode % gifs_frequency == 0
+                        save_frames_as_gif(frames, filename=f'episode_{i_episode}.gif')
                     break
                 
     except KeyboardInterrupt:
