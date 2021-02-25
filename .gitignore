@@ -1,4 +1,6 @@
 gifs
+logs
 recordings
+wandb
 .vscode
 .ipynb_checkpoints
