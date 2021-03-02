@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
+import wandb
 
 from timing import Timing
 
@@ -79,17 +80,15 @@ class RandomActor:
         self.input_shape = (screen_height, screen_width, n_channels)
 
         self.memory = ReplayMemory(buffer_size)
-        self.state = self.format_observation(np.zeros(self.input_shape))
-        self.last_observation = torch.clone(self.state)
+        self.last_observation = self.format_observation(np.zeros(self.input_shape))
 
     def format_observation(self, screen):
         return torch.from_numpy(screen.transpose((2, 0, 1))).unsqueeze(0).to(device, dtype=torch.float)
 
     def new_episode(self, observation):
-        self.state = self.format_observation(np.zeros(self.input_shape))
         self.last_observation = self.format_observation(observation)
 
-    def step(self, env):
+    def step(self, env, timing):
 
         # Select and perform an action
         with Timing(timing, 'time_choose_act'):
@@ -98,19 +97,16 @@ class RandomActor:
         with Timing(timing, 'time_perform_act'):
             raw_observation, reward, done, info = env.step(action.item())
 
-        with Timing(timing, 'time_format_obs'):
-            observation = self.format_observation(raw_observation)
-            reward = torch.tensor([reward], device=device)
+        observation = self.format_observation(raw_observation)
+        reward = torch.tensor([reward], device=device)
 
         if not done:
-            next_state = observation - self.last_observation
+            next_state = observation
         else:
             next_state = None
 
         # Store the transition in memory
-        self.memory.push(self.state, action, next_state, reward)
-
-        self.state = next_state
+        self.memory.push(self.last_observation, action, next_state, reward)
         self.last_observation = observation
 
         return raw_observation, reward, done, info, action
@@ -123,11 +119,14 @@ class DQNActor:
                  batch_size=32, target_update=2000, learning_rate=0.00025, buffer_size=1_000_000):
         self.n_actions = n_actions
         self.gamma = gamma
+        self.eps_const = eps_const
         if eps_const is None:
             self.eps_start = eps_start
             self.eps_end = eps_end
             self.eps_decay = eps_decay
-        self.eps_const = eps_const
+            self.eps_threshold = eps_start
+        else:
+            self.eps_threshold = eps_const
         self.batch_size = batch_size
         self.target_update = target_update
 
@@ -142,8 +141,7 @@ class DQNActor:
 
         self.steps_done = 0
 
-        self.state = self.format_observation(np.zeros(self.input_shape))
-        self.last_observation = torch.clone(self.state)
+        self.last_observation = self.format_observation(np.zeros(self.input_shape))
 
     # Reshape to torch order CHW and add a batch dimension (BCHW)
     def format_observation(self, screen):
@@ -156,6 +154,7 @@ class DQNActor:
         else:
             eps_threshold = self.eps_start - self.steps_done * (self.eps_start - self.eps_end) / self.eps_decay
             eps_threshold = max(self.eps_end, eps_threshold) # make sure we don't go lower than eps_endd
+        self.eps_threshold = eps_threshold
         self.steps_done += 1
         if sample > eps_threshold:
             with torch.no_grad():
@@ -215,35 +214,32 @@ class DQNActor:
         self.optimizer.step()
 
         if self.steps_done % self.target_update == 0:
+            wandb.log({
+                'target_update': i_episode,
+            }, commit=False)
             self.target_net.load_state_dict(self.policy_net.state_dict())
 
     def new_episode(self, observation):
-        self.state = self.format_observation(np.zeros(self.input_shape))
         self.last_observation = self.format_observation(observation)
 
     def step(self, env, i_episode, timing):
 
         # Select and perform an action
         with Timing(timing, 'time_choose_act'):
-            action = self.select_action(self.state)
+            action = self.select_action(self.last_observation)
 
         with Timing(timing, 'time_perform_act'):
             raw_observation, reward, done, info = env.step(action.item())
 
-        with Timing(timing, 'time_format_obs'):
-            observation = self.format_observation(raw_observation)
-            reward = torch.tensor([reward], device=device)
+        observation = self.format_observation(raw_observation)
+        reward = torch.tensor([reward], device=device)
 
         if not done:
-            next_state = observation - self.last_observation
+            next_state = observation
         else:
             next_state = None
 
-        # Store the transition in memory
-        self.memory.push(self.state, action, next_state, reward)
-
-        # Move to the next state
-        self.state = next_state
+        self.memory.push(self.last_observation, action, next_state, reward)
         self.last_observation = observation
 
 
