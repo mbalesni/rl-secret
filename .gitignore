@@ -1,14 +1,15 @@
+# runs
+nohup.out
 gifs
 logs
 recordings
 wandb
+
+# Python/vscode
 .vscode
 .ipynb_checkpoints
 *.pyc
 *__pycache__
 *egg-info
-trained_models
-
-# PyPI
 build/*
 dist/*
