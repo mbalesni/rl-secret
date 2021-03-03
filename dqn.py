@@ -161,7 +161,10 @@ class DQNActor:
                 # t.max(1) will return largest column value of each row.
                 # second column on max result is index of where max element was
                 # found, so we pick action with the larger expected reward.
-                return self.policy_net(observation).max(1)[1].view(1, 1)
+                self.policy_net.eval()
+                result = self.policy_net(observation).max(1)[1].view(1, 1)
+                self.policy_net.train()
+                return result
         else:
             return torch.tensor([[random.randrange(self.n_actions)]], device=device, dtype=torch.long)
 
