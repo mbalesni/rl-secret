@@ -128,7 +128,7 @@ def train(note, env_name, seed, log_frequency, episodes,
         timing = dict()               
         print('Filling buffer...')
         i_episode = 0
-        for i_step in tqdm(range(buffer_prefill_steps)):
+        for i_step in tqdm(range(1, buffer_prefill_steps+1)):
             observation, reward, done, info, action = random_actor.step(env, timing)
 
             if record_random:
@@ -142,7 +142,7 @@ def train(note, env_name, seed, log_frequency, episodes,
                     recording['episodes'].append([])
                 actor.new_episode(observation)
 
-                if i_episode > 0 and (i_episode % log_frequency) == 0:
+                if i_episode > 1 and (i_episode % log_frequency) == 0:
                     wandb.log({
                         'buff_episode': i_episode,
                         **{k: v['time'] / v['count'] for k, v in timing.items()}
@@ -152,7 +152,7 @@ def train(note, env_name, seed, log_frequency, episodes,
         actor.memory = random_actor.memory
         timing = dict()               
         print('Training...')
-        for i_episode in tqdm(range(episodes)):
+        for i_episode in tqdm(range(1, episodes+1)):
             observation = env.reset()
             actor.new_episode(observation)
             if record:
@@ -175,7 +175,7 @@ def train(note, env_name, seed, log_frequency, episodes,
                     rewards = []
                     break
 
-            if i_episode > 0 and (i_episode % log_frequency) == 0:
+            if i_episode > 1 and (i_episode % log_frequency) == 0:
 
                 wandb.log({
                     'avg_episode_duration': np.mean(logs['episode_durations']),

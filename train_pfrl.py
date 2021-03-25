@@ -47,7 +47,8 @@ def save_experience(base_dir):
 @click.option('--note', type=str, help='message to explain how is this run different')
 @click.option('--env-name', type=str, default='MiniGrid-Triggers-3x3-v0')
 @click.option('--seed', type=int, default=42, help='random seed used')
-@click.option('--log-frequency', type=int, default=5e1, help='logging frequency in episodes')
+@click.option('--log-frequency', type=int, default=5e1, help='logging frequency, episodes')
+@click.option('--model-save-frequency', type=int, default=5e3, help='model saving frequency, episodes')
 @click.option('--episodes', type=int, help='number of episodes to train for', required=True)
 @click.option('--learning-rate', type=float, default=1e-1, help='goal learning rate')
 @click.option('--gamma', type=float, default=0.999, help='discount factor')
@@ -63,7 +64,7 @@ def save_experience(base_dir):
 @click.option('--target-freq', type=int, default=2000, help='how frequently to update target network')
 @click.option('--update-freq', type=int, default=1, help='how frequently to run optimization')
 @click.option('--use-wandb/--no-wandb', default=True)
-def train(note, env_name, seed, log_frequency, episodes, 
+def train(note, env_name, seed, log_frequency, model_save_frequency, episodes, 
           learning_rate, gamma, eps_start, eps_end, eps_decay, 
           buffer_size, buffer_prefill_steps, batch_size, 
           part_observ, record, record_random, target_freq, update_freq, use_wandb):
@@ -81,6 +82,7 @@ def train(note, env_name, seed, log_frequency, episodes,
                 env_name=env_name,
                 seed=seed,
                 log_frequency=log_frequency,
+                model_save_frequency=model_save_frequency,
                 episodes=episodes,
                 learning_rate=learning_rate,
                 gamma=gamma,
@@ -128,7 +130,7 @@ def train(note, env_name, seed, log_frequency, episodes,
 
         timing = dict()               
         print('Training...')
-        for i_episode in range(episodes):
+        for i_episode in range(1, episodes+1):
             observation = env.reset()
             if record:
                 recording['episodes'].append([])
@@ -157,11 +159,14 @@ def train(note, env_name, seed, log_frequency, episodes,
                     logs['episode_durations'].append(len(rewards))
                     break
 
-            if i_episode > 0 and (i_episode % log_frequency) == 0:
+            if i_episode > 1 and (i_episode % log_frequency) == 0:
+
+                avg_duration = np.mean(logs['episode_durations'])
+                avg_return = torch.mean(torch.tensor(logs['episode_returns'], device='cpu', dtype=torch.float))
 
                 wandb.log({
-                    'avg_episode_duration': np.mean(logs['episode_durations']),
-                    'avg_episode_return': torch.mean(torch.tensor(logs['episode_returns'], device='cpu', dtype=torch.float)),
+                    'avg_episode_duration': avg_duration,
+                    'avg_episode_return': avg_return,
                     'video': frames_to_video(frames),
                     'episode': i_episode,
                     'agent_step': actor.cumulative_steps,
@@ -172,7 +177,11 @@ def train(note, env_name, seed, log_frequency, episodes,
                 logs['episode_returns'] = []
                 timing = dict()
 
-                actor.save(os.path.join(save_dir, 'agent'))
+                if i_episode % model_save_frequency == 0:
+                    agent_version_folder = f'ep{i_episode}_dur{avg_duration:.2f}_ret{avg_return:.2f}'
+                    path_to_model = os.path.join(save_dir, 'agent', agent_version_folder)
+                    os.makedirs(path_to_model, exist_ok=True)
+                    actor.save(path_to_model)
 
                 if record:
                     if use_wandb:
