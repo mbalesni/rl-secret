@@ -1,229 +1,216 @@
-from reward_predictor import RewardPredictor
+import numpy as np
 import torch
+import torch.nn as nn
+import torch.optim as optim
+import click
+import os
+import random
 
-observation_dims = (3, 64, 64)
-n_actions = 3
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+import wandb
+from timing import Timing
+from tqdm import tqdm
 
-model = RewardPredictor(observation_dims, n_actions, device, max_len=50).to(device)
+from reward_predictor import RewardPredictor
+from trajectories import load_trajectories, get_data_loaders
 
-observations = torch.rand((50, 32, 3, 64, 64), device=device)
-actions = torch.vstack( (torch.tensor([1,0,0], device=device),) * 32)
-actions = torch.unsqueeze(actions, 0)
-actions = torch.vstack( (actions,) * 50)
-
-out = model.forward(observations, actions)
-
-print(out)
-print(out.shape)
-
-# def get_data_loaders(dataset, batch_size=1024, validation_subset=0, seed=42):
-
-#     if validation_subset > 0:
-#         n_total_samples = len(dataset)
-#         n_train_samples = math.floor(n_total_samples * (1-validation_subset))
-#         n_valid_samples = n_total_samples - n_train_samples
-
-#         train_dataset, valid_dataset = random_split(
-#             dataset,
-#             [n_train_samples, n_valid_samples],
-#             generator=torch.Generator().manual_seed(seed)
-#         )  # reproducible results
-
-#         train_loader = DataLoader(train_dataset, batch_size=batch_size)
-#         valid_loader = DataLoader(valid_dataset, batch_size=batch_size)
-
-#         print('Train set size:', len(train_dataset), 'samples')
-#         print('Train set:', len(train_loader), 'batches')
-#         print('Validation set size:', len(valid_dataset), 'samples')
-#         print('Validation set:', len(valid_loader), 'batches')
-#     else:
-#         train_loader = DataLoader(dataset, batch_size=batch_size)
-#         valid_loader = None
-#         print('Prepared:', len(train_loader), 'batches')
-
-#     return train_loader, valid_loader
-
-# # Load dataset
-
-# path_to_dataset = '/content/drive/MyDrive/Self-Attention/datasets/dataset-perfect-agent-1.pt'
-# dataset = torch.load(path_to_dataset)
-
-# validation_size = 0.2
-# batch_size = 1024
-# train_loader, valid_loader = get_data_loaders(dataset,
-#                                               batch_size=batch_size,
-#                                               validation_subset=validation_size)
+PAD_VAL = 10
+ACTION_SPACE_SIZE = 3
+OBSERVATION_SPACE_DIMS = (3, 24, 24)
 
 
-# def evaluate(model, criterion, data_loader, device, verbose=False):
-#     losses = []
-#     accuracies = []
+def evaluate(model, criterion, data_loader, device, timing, verbose=False):
+    losses = []
+    accuracies = []
 
-#     for batch_idx, batch in enumerate(data_loader):
-#         observations, actions, rewards = batch
+    for batch_idx, batch in enumerate(data_loader):
+        observations, actions, rewards = batch
 
-#         observations = observations.transpose(0, 1).to(device)
-#         actions = actions.transpose(0, 1).to(device)
-#         rewards = rewards.transpose(0, 1).to(device)
+        with Timing(timing, 'time_eval_preprocess'):
+            observations = observations.transpose(
+                2, 4).transpose(0, 1).to(device)
+            actions = actions.transpose(0, 1).to(device)
+            rewards = rewards.transpose(0, 1).to(device)
 
-#         output = model(observations, actions)
+            returns = torch.ones_like(rewards)
+            # return for each episode in batch
+            returns += torch.sum(rewards, axis=0)[None, :]
+            returns += 1  # turns values (-1,0,1) into "classes" (0,1,2)
 
-#         # reshape for CrossEntropyLoss
-#         output = output.permute(1, 2, 0)
-#         rewards = rewards.transpose(0, 1)
+        with Timing(timing, 'time_eval_run_inference'):
+            output = model(observations, actions)
 
-#         loss = criterion(output, rewards)
-#         preds = output.argmax(dim=1)
-#         masked_preds = preds[rewards != pad_val]
-#         masked_rewards = rewards[rewards != pad_val]
-#         accuracy = torch.sum(masked_preds == masked_rewards) / \
-#             masked_rewards.numel()
+        with Timing(timing, 'time_eval_calc_metrics'):
+            # reshape for CrossEntropyLoss
+            output = output.permute(1, 2, 0)
+            rewards = rewards.transpose(0, 1)
 
-#         losses.append(loss.item())
-#         accuracies.append(accuracy.item())
+            loss = criterion(output, rewards)
+            preds = output.argmax(dim=1)
+            masked_preds = preds[rewards != PAD_VAL]
+            masked_rewards = rewards[rewards != PAD_VAL]
+            accuracy = torch.sum(masked_preds == masked_rewards) / \
+                masked_rewards.numel()
 
-#         del observations
-#         del actions
-#         del rewards
-#         del output
+        losses.append(loss.item())
+        accuracies.append(accuracy.item())
 
-#     mean_loss = sum(losses) / len(losses)
-#     mean_acc = sum(accuracies) / len(accuracies)
+        del observations
+        del actions
+        del rewards
+        del output
 
-#     del losses
-#     del accuracies
+    mean_loss = sum(losses) / len(losses)
+    mean_acc = sum(accuracies) / len(accuracies)
 
-#     if verbose:
-#         print('mean_loss:', mean_loss)
-#         print('mean_acc:', mean_acc)
+    del losses
+    del accuracies
 
-#     return mean_loss, mean_acc
+    if verbose:
+        print('mean_loss:', mean_loss)
+        print('mean_acc:', mean_acc)
+
+    return mean_loss, mean_acc
 
 
-# RESUME = True
-# CHECKPOINT_PATH = 'checkpoint-vloss-0.0502'
-# RUN_PATH = 'runs/run-1'
+@click.command()
+@click.option('--note', type=str, help='message to explain how is this run different', required=True)
+@click.option('--data', type=click.Path, help='path to trajectories dataset', required=True)
+@click.option('--seed', type=int, default=42, help='random seed used')
+@click.option('--log-frequency', type=int, default=5e1, help='logging frequency, iterations')
+@click.option('--learning-rate', type=float, default=3e-3, help='goal learning rate')
+@click.option('--epochs', type=int, default=10, help='number of epochs to train for')
+@click.option('--batch-size', default=128, help='training batch size')
+@click.option('--valid-size', type=float, default=0.2, help='proportion of validation set')
+@click.option('--use-wandb/--no-wandb', default=True)
+def train(note, data, seed, log_frequency,
+          learning_rate, epochs, batch_size, valid_size, use_wandb):
 
-# # Training hyperparameters
-# num_epochs = 10
-# learning_rate = 3e-3
-# batch_size = 1024
-# # TODO: second weight might be a typo in the paper, consider 0.002
-# class_weights = torch.tensor([0.499, 0.02, 0.499]).to(device)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
-# # Model hyperparameters
-# max_len = 201
+    wandb.login()
+    wandb.init(project='attentional_fw_baselines',
+               entity='ut-rl-credit',
+               notes=note,
+               mode='online' if use_wandb else 'disabled',
+               config=dict(
+                   seed=seed,
+                   learning_rate=learning_rate,
+                   batch_size=batch_size,
+               ))
+    # Upload models at the end of training
+    save_dir = wandb.run.dir if use_wandb else './'
+    wandb.save(os.path.join(save_dir, "*.pt"))
 
-# model = SelfAttentionForRL(
-#     observation_size, action_size, device, verbose=False).to(device)
+    torch.cuda.manual_seed(seed)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
 
-# step = 0
-# start_epoch = 0
+    # data
+    dataset = load_trajectories(data)
+    train_loader, valid_loader = get_data_loaders(
+        dataset, batch_size, valid_size)
 
-# optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-# scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-#     optimizer, factor=0.1, patience=10, verbose=True
-# )
+    # model
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    class_weights = torch.tensor([0.499, 0.02, 0.499]).to(device)
+    model = RewardPredictor(
+        OBSERVATION_SPACE_DIMS, ACTION_SPACE_SIZE, device, verbose=False).to(device)
 
-# criterion = nn.CrossEntropyLoss(weight=class_weights, ignore_index=pad_val)
+    wandb.watch()
 
-# if RESUME and os.path.isfile(CHECKPOINT_PATH):
-#     print(f'> Loading from checkpoint at {CHECKPOINT_PATH}')
-#     checkpoint = torch.load(CHECKPOINT_PATH)
-#     model.load_state_dict(checkpoint['model_state_dict'])
-#     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-#     scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-#     start_epoch = checkpoint['epoch']
-#     step = checkpoint['step']
-#     RUN_PATH = checkpoint['run_path']
-#     del checkpoint
-#     print(f'> Resuming run at: {RUN_PATH}')
-# else:
-#     print(f'> Checkpoint not found. Starting new run at: {RUN_PATH}...')
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, factor=0.1, patience=10, verbose=True
+    )
 
-# best_val_loss = 1e9
+    criterion = nn.CrossEntropyLoss(weight=class_weights, ignore_index=PAD_VAL)
 
-# for epoch in range(start_epoch, num_epochs):
-#     print(f"> Epoch {epoch+1}/{num_epochs}", end=' ')
+    for epoch in range(epochs):
+        print(f"> Epoch {epoch+1}/{epochs}", end=' ')
 
-#     losses = []
-#     is_best_model = True
+        losses = []
 
-#     pbar = tqdm(train_loader)
+        pbar = tqdm(train_loader)
 
-#     for batch_idx, batch in enumerate(pbar):
-#         observations, actions, rewards = batch
+        for batch_idx, batch in enumerate(pbar):
+            observations, actions, rewards = batch
 
-#         observations = observations.transpose(0, 1).to(device)
-#         actions = actions.transpose(0, 1).to(device)
-#         rewards = rewards.transpose(0, 1).to(device)
+            timing = dict()
 
-#         output = model(observations, actions)
+            with Timing(timing, 'time_preprocess'):
+                observations = observations.transpose(
+                    2, 4).transpose(0, 1).to(device)
+                actions = actions.transpose(0, 1).to(device)
+                rewards = rewards.transpose(0, 1).to(device)
 
-#         # Reshape output for K-dimensional CrossEntropy loss
-#         output = output.permute(1, 2, 0)
-#         rewards = rewards.transpose(0, 1)
+                returns = torch.ones_like(rewards)
+                # return for each episode in batch
+                returns += torch.sum(rewards, axis=0)[None, :]
+                returns += 1  # turns values (-1,0,1) into "classes" (0,1,2)
 
-#         # Compute loss
-#         optimizer.zero_grad()
+            with Timing(timing, 'time_run_inference'):
+                output = model(observations, actions)
 
-#         loss = criterion(output, rewards)
-#         losses.append(loss.item())
+            # Reshape output for K-dimensional CrossEntropy loss
+            with Timing(timing, 'time_optimize_model'):
+                output = output.permute(1, 2, 0)
+                returns = returns.transpose(0, 1)
 
-#         loss.backward()
+                # Compute loss
+                optimizer.zero_grad()
 
-#         # Clip to avoid exploding gradient issues
-#         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1)
+                loss = criterion(output, returns)
+                losses.append(loss.item())
 
-#         optimizer.step()
+                loss.backward()
 
-#         # plot to tensorboard
-#         model.eval()
-#         val_loss, val_acc = evaluate(model, criterion, valid_loader, device)
+                # Clip to avoid exploding gradient issues
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1)
 
-#         preds = output.argmax(dim=1)
-#         masked_preds = preds[rewards != pad_val]
-#         masked_rewards = rewards[rewards != pad_val]
-#         acc = torch.sum(masked_preds == masked_rewards) / \
-#             masked_rewards.numel()
+                optimizer.step()
 
-#         writer.add_scalar("Training loss", loss, global_step=step)
-#         writer.add_scalar("Training acc", acc, global_step=step)
-#         writer.add_scalar("Validation loss", val_loss, global_step=step)
-#         writer.add_scalar("Validation acc", val_acc, global_step=step)
+            with Timing(timing, 'time_evaluate_model'):
+                model.eval()
+                val_loss, val_acc = evaluate(
+                    model, criterion, valid_loader, device, timing)
 
-#         pbar.set_postfix_str(
-#             f'loss: {loss:0.5f}, acc: {acc:0.5f}, val_loss: {val_loss:0.5f}, val_acc: {val_acc:0.5f}')
+                preds = output.argmax(dim=1)
+                masked_preds = preds[rewards != PAD_VAL]
+                masked_rewards = rewards[rewards != PAD_VAL]
+                acc = torch.sum(masked_preds == masked_rewards) / \
+                    masked_rewards.numel()
 
-#         model.train()
+            wandb.log({
+                'loss': loss,
+                'acc': acc,
+                'val_loss': val_loss,
+                'val_acc': val_acc,
+                'epoch': epoch,
+                **{k: v['time'] / v['count'] for k, v in timing.items()}
+            }, )
+            timing = dict()
 
-#         step += 1
+            pbar.set_postfix_str(
+                f'loss: {loss:0.5f}, acc: {acc:0.5f}, val_loss: {val_loss:0.5f}, val_acc: {val_acc:0.5f}')
 
-#         del observations
-#         del actions
-#         del rewards
-#         del output
-#         del preds
+            model.train()
 
-#     is_best_model = val_loss < best_val_loss
+            del observations
+            del actions
+            del rewards
+            del output
+            del preds
 
-#     if is_best_model:
-#         print(f'> Saving checkpoint with val loss: {val_loss:.4f}...')
-#         best_val_loss = val_loss
-#         torch.save({
-#             'model_state_dict': model.state_dict(),
-#             'optimizer_state_dict': optimizer.state_dict(),
-#             'scheduler_state_dict': scheduler.state_dict(),
-#             'epoch': epoch,
-#             'run_path': RUN_PATH,
-#             'step': step
-#         }, f'checkpoint-vloss-{val_loss:.4f}')
-#     else:
-#         print(f'> NOT saving checkpoint, val loss: {val_loss:.4f}...')
+        # free some GPU memory
+        torch.cuda.empty_cache()
 
-#     # free some GPU memory
-#     torch.cuda.empty_cache()
+        mean_loss = sum(losses) / len(losses)
+        scheduler.step(mean_loss)
 
-#     mean_loss = sum(losses) / len(losses)
-#     scheduler.step(mean_loss)
+    wandb.finish()
+
+
+if __name__ == '__main__':
+    train()

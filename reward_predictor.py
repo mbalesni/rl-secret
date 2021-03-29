@@ -4,16 +4,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from torch.utils.data import Dataset
-
-# Input parameters
-observation_size = 164
-observation_dims = (3, 64, 64)
-action_size = 3
-pad_val = 10  # used to pad sequences to same size, will be ignored by the model, loss and accuracy
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-class_weights = torch.tensor([0.499, 0.02, 0.499]).to(device)
-
 
 class TransformerEncoderCustom(nn.TransformerEncoderLayer):
     '''Modified to return *attention weights* in addition to output'''
@@ -68,7 +58,7 @@ class RewardPredictor(nn.Module):
 
     def __init__(
         self,
-        observation_dims,  # TODO: update parameters for how I instantiate the class
+        observation_dims,
         action_size,
         device,
         dim_feedforward=128,
@@ -148,22 +138,3 @@ class RewardPredictor(nn.Module):
         padding_mask = batch_of_sequences.transpose(
             0, 1)[:, :, 0, 0, 0] == self.pad_val
         return padding_mask.to(self.device)
-
-# support the format of the trajectories dataset
-
-
-class TrajectoriesDataset(Dataset):
-    def __init__(self, observations, actions, rewards):
-        self.samples = []
-
-        n_batches = observations.shape[0]
-
-        for i_batch in range(n_batches):
-            self.samples.append(
-                (observations[i_batch, :], actions[i_batch, :], rewards[i_batch, :]))
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        return self.samples[idx]

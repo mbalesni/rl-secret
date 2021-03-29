@@ -4,6 +4,7 @@ gifs
 logs
 recordings
 wandb
+trajectories
 
 # Python/vscode
 .vscode
