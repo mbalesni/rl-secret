@@ -108,7 +108,7 @@ class RewardPredictor(nn.Module):
         x = self.pos_encoder(x)
 
         src_mask = self.generate_square_subsequent_mask(sz=seq_length)
-        padding_mask = self.make_padding_mask(observations.rename(None))
+        padding_mask = self.make_padding_mask(actions)
 
         out, attention = self.self_attention(
             x,
@@ -133,8 +133,8 @@ class RewardPredictor(nn.Module):
         return mask.to(self.device)
 
     def make_padding_mask(self, batch_of_sequences):
-        # batch_of_sequences (S, N, C, H, W)
+        # batch_of_sequences (S, N, A)
         # return (N, S)
         padding_mask = batch_of_sequences.transpose(
-            0, 1)[:, :, 0, 0, 0] == self.pad_val
+            0, 1)[:, :, 0] == self.pad_val
         return padding_mask.to(self.device)
