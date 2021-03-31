@@ -44,16 +44,6 @@ def record(note, env_name, seed, log_frequency, episodes, model_dir, use_wandb):
     torch.backends.cudnn.benchmark = False
 
     wandb.login()
-    wandb.init(project='attentional_fw_baselines',
-               entity='ut-rl-credit',
-               notes=note,
-               mode='online' if use_wandb else 'disabled',
-               config=dict(
-                   env_name=env_name,
-                   seed=seed,
-                   log_frequency=log_frequency,
-                   episodes=episodes,
-               ))
 
     save_dir = './'
 
@@ -76,6 +66,19 @@ def record(note, env_name, seed, log_frequency, episodes, model_dir, use_wandb):
         break
 
     for agent_dir in agent_dirs:
+        wandb.init(project='attentional_fw_baselines',
+                   entity='ut-rl-credit',
+                   notes='Collecting trajectories with one of the RL agents',
+                   mode='online' if use_wandb else 'disabled',
+                   config=dict(
+                       agent=agent_dir,
+                       env_name=env_name,
+                       seed=seed,
+                       log_frequency=log_frequency,
+                       episodes=episodes,
+                   ),
+                   reinit=True)
+
         actor = DQN_PFRL_ACTOR(*observation_shape, 3, env=env).agent
         actor.load(os.path.join(trajectories_base_dir, agent_dir, 'agent'))
 
@@ -99,7 +102,8 @@ def record(note, env_name, seed, log_frequency, episodes, model_dir, use_wandb):
                             observation, reward, done, _ = env.step(action)
 
                         with Timing(timing, 'time_observe'):
-                            actor.observe(observation['image'], reward, done, reset=False)
+                            actor.observe(
+                                observation['image'], reward, done, reset=False)
 
                         frames.append(env.render(mode='rgb_array'))
                         rewards.append(reward)
@@ -133,11 +137,12 @@ def record(note, env_name, seed, log_frequency, episodes, model_dir, use_wandb):
                         logs['episode_returns'] = []
                         timing = dict()
 
-        save_trajectories(trajectories, trajectories_base_dir, agent_dir)
+        save_trajectories(trajectories, trajectories_base_dir,
+                          agent_dir, env.action_space.n)
         trajectories = []
+        wandb.finish()
 
     env.close()
-    wandb.finish()
 
 
 if __name__ == '__main__':
