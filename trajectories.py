@@ -1,5 +1,4 @@
 import os
-import pickle
 import math
 
 import torch
@@ -22,13 +21,12 @@ class TrajectoriesDataset(Dataset):
 
 
 def load_trajectories(path_to_dataset):
-    with open(path_to_dataset, 'rb') as f:
-        dataset = pickle.load(f)
+    dataset = torch.load(path_to_dataset)
 
     return dataset
 
 
-def episodes_to_tensors(episodes, verbose=False, pad_val=10.):
+def episodes_to_tensors(episodes, action_size, verbose=False, pad_val=10.):
 
     observations_by_episode = []
     actions_by_episode = []
@@ -44,19 +42,19 @@ def episodes_to_tensors(episodes, verbose=False, pad_val=10.):
             observation, action, reward, done = step
 
             observations.append(observation)
-            actions.append(one_hot_encode_action(action, 3))  # FIXME: use variable action size
+            actions.append(one_hot_encode_action(action, action_size))
             rewards.append(reward)
 
-        observations = torch.tensor(observations, dtype=torch.uint8)
-        actions = torch.stack(actions).type(torch.int8)
-        rewards = torch.tensor(rewards, dtype=torch.int8)
+        observations = torch.tensor(observations, dtype=torch.float32)
+        actions = torch.stack(actions).type(torch.float32)
+        rewards = torch.tensor(rewards, dtype=torch.long)
 
         observations_by_episode.append(observations)
         actions_by_episode.append(actions)
         rewards_by_episode.append(rewards)
 
     observations_by_episode = pad_sequence(
-        observations_by_episode, batch_first=True, padding_value=pad_val)
+        observations_by_episode, batch_first=True, padding_value=0)
     actions_by_episode = pad_sequence(
         actions_by_episode, batch_first=True, padding_value=pad_val)
     rewards_by_episode = pad_sequence(
@@ -70,11 +68,11 @@ def one_hot_encode_action(action, n_classes=3):
     return one_hot(index, n_classes)
 
 
-def save_trajectories(trajectories, base_dir, agent_dir, pad_val=10):
+def save_trajectories(trajectories, base_dir, agent_dir, action_size, pad_val=10):
     print('Saving experience...')
     # convert list of episodes into PyTorch dataset
     observations, actions, rewards = episodes_to_tensors(
-        trajectories, verbose=False, pad_val=pad_val)
+        trajectories, action_size, verbose=False, pad_val=pad_val)
     dataset = TrajectoriesDataset(observations, actions, rewards)
 
     # create a new folder for dataset
@@ -83,14 +81,24 @@ def save_trajectories(trajectories, base_dir, agent_dir, pad_val=10):
     recording_name = f'{len(trajectories)/1000:.2f}K.pt'
     full_path = os.path.join(directory, recording_name)
 
-    # torch.save(dataset, full_path)  # TODO: check if this is faster
-
-    # save dataset to file
-    with open(full_path, 'wb') as f:
-        pickle.dump(dataset, f)
+    torch.save(dataset, full_path)
 
 
+def normalize_observations(dataset):
+    mean = torch.mean(dataset.observations, axis=(0, 1, 2, 3))
+    std = torch.std(dataset.observations, axis=(0, 1, 2, 3))
+
+    dataset.observations -= mean
+    dataset.observations /= std
+
+    return mean, std
+
+
+# TODO: choose validation indices first, and then use them
+# to count normalization values (mean, std) only on the train subset
 def get_data_loaders(dataset, batch_size=1024, validation_subset=0, seed=42, verbose=False):
+
+    mean, std = normalize_observations(dataset)
 
     if validation_subset > 0:
         n_total_samples = len(dataset)

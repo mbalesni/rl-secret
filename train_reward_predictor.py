@@ -31,7 +31,7 @@ def evaluate(model, criterion, data_loader, device, timing, verbose=False):
             actions = actions.transpose(0, 1).to(device)
             rewards = rewards.transpose(0, 1).to(device)
 
-            returns = torch.ones_like(rewards)
+            returns = torch.zeros_like(rewards)
             # return for each episode in batch
             returns += torch.sum(rewards, axis=0)[None, :]
             returns += 1  # turns values (-1,0,1) into "classes" (0,1,2)
@@ -41,15 +41,15 @@ def evaluate(model, criterion, data_loader, device, timing, verbose=False):
 
         with Timing(timing, 'time_eval_calc_metrics'):
             # reshape for CrossEntropyLoss
-            output = output.permute(1, 2, 0)
-            rewards = rewards.transpose(0, 1)
+            output = output.permute(0, 2, 1)
+            returns = returns.transpose(0, 1)
 
-            loss = criterion(output, rewards)
+            loss = criterion(output, returns)
             preds = output.argmax(dim=1)
-            masked_preds = preds[rewards != PAD_VAL]
-            masked_rewards = rewards[rewards != PAD_VAL]
-            accuracy = torch.sum(masked_preds == masked_rewards) / \
-                masked_rewards.numel()
+            masked_preds = preds[returns != PAD_VAL]
+            masked_returns = returns[returns != PAD_VAL]
+            accuracy = torch.sum(masked_preds == masked_returns) / \
+                masked_returns.numel()
 
         losses.append(loss.item())
         accuracies.append(accuracy.item())
@@ -74,7 +74,7 @@ def evaluate(model, criterion, data_loader, device, timing, verbose=False):
 
 @click.command()
 @click.option('--note', type=str, help='message to explain how is this run different', required=True)
-@click.option('--data', type=click.Path, help='path to trajectories dataset', required=True)
+@click.option('--data', type=click.Path(exists=True), help='path to trajectories dataset', required=True)
 @click.option('--seed', type=int, default=42, help='random seed used')
 @click.option('--log-frequency', type=int, default=5e1, help='logging frequency, iterations')
 @click.option('--learning-rate', type=float, default=3e-3, help='goal learning rate')
@@ -94,9 +94,12 @@ def train(note, data, seed, log_frequency,
                notes=note,
                mode='online' if use_wandb else 'disabled',
                config=dict(
-                   seed=seed,
-                   learning_rate=learning_rate,
                    batch_size=batch_size,
+                   data=data,
+                   epochs=epochs,
+                   learning_rate=learning_rate,
+                   seed=seed,
+                   valid_size=valid_size,
                ))
     # Upload models at the end of training
     save_dir = wandb.run.dir if use_wandb else './'
@@ -118,7 +121,7 @@ def train(note, data, seed, log_frequency,
     model = RewardPredictor(
         OBSERVATION_SPACE_DIMS, ACTION_SPACE_SIZE, device, verbose=False).to(device)
 
-    wandb.watch()
+    wandb.watch(model)
 
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -145,7 +148,7 @@ def train(note, data, seed, log_frequency,
                 actions = actions.transpose(0, 1).to(device)
                 rewards = rewards.transpose(0, 1).to(device)
 
-                returns = torch.ones_like(rewards)
+                returns = torch.zeros_like(rewards)
                 # return for each episode in batch
                 returns += torch.sum(rewards, axis=0)[None, :]
                 returns += 1  # turns values (-1,0,1) into "classes" (0,1,2)
@@ -155,7 +158,7 @@ def train(note, data, seed, log_frequency,
 
             # Reshape output for K-dimensional CrossEntropy loss
             with Timing(timing, 'time_optimize_model'):
-                output = output.permute(1, 2, 0)
+                output = output.permute(0, 2, 1)
                 returns = returns.transpose(0, 1)
 
                 # Compute loss
@@ -177,10 +180,10 @@ def train(note, data, seed, log_frequency,
                     model, criterion, valid_loader, device, timing)
 
                 preds = output.argmax(dim=1)
-                masked_preds = preds[rewards != PAD_VAL]
-                masked_rewards = rewards[rewards != PAD_VAL]
-                acc = torch.sum(masked_preds == masked_rewards) / \
-                    masked_rewards.numel()
+                masked_preds = preds[returns != PAD_VAL]
+                masked_returns = returns[returns != PAD_VAL]
+                acc = torch.sum(masked_preds == masked_returns) / \
+                    masked_returns.numel()
 
             wandb.log({
                 'loss': loss,
@@ -209,6 +212,7 @@ def train(note, data, seed, log_frequency,
         mean_loss = sum(losses) / len(losses)
         scheduler.step(mean_loss)
 
+    model.save(save_dir, 'model.pt')
     wandb.finish()
 
 
