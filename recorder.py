@@ -95,6 +95,8 @@ def record(note, env_name, seed, log_frequency, episodes, model_dir, use_wandb):
                     rewards = []
 
                     for i_step in count():
+                        partial_observation = observation['image_partial']
+
                         with Timing(timing, 'time_choose_act'):
                             action = actor.act(observation['image'])
 
@@ -109,7 +111,6 @@ def record(note, env_name, seed, log_frequency, episodes, model_dir, use_wandb):
                         rewards.append(reward)
 
                         # record cropped, *partial* observation for reward-prediction model
-                        partial_observation = observation['image_partial']
                         step = (partial_observation, action, reward, done)
                         trajectories[i_episode-1].append(step)
 
