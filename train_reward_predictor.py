@@ -212,7 +212,7 @@ def train(note, data, seed, log_frequency,
         mean_loss = sum(losses) / len(losses)
         scheduler.step(mean_loss)
 
-    model.save(save_dir, 'model.pt')
+    torch.save(model, os.path.join(save_dir, 'model.pt'))
     wandb.finish()
 
 
