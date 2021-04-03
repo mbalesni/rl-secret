@@ -17,13 +17,48 @@ class TrajectoriesDataset(Dataset):
         return len(self.observations)
 
     def __getitem__(self, idx):
-        return (self.observations[idx, :], self.actions[idx, :], self.rewards[idx, :])
+        return (self.observations[idx, :], self.actions[idx, :], self.rewards[idx, :], idx)
 
 
-def load_trajectories(path_to_dataset):
-    dataset = torch.load(path_to_dataset)
+def preprocess_dataset(dataset, data_path, batch_size=128, valid_size=0.2, seed=42, sum_rewards=True, normalize=True):
 
-    return dataset
+    train_subset, valid_subset = validation_split(
+        dataset, valid_size, seed=seed)
+
+    if normalize:
+        # calculate normalization values on train subset
+        train_mean = torch.mean(
+            dataset.observations[train_subset.indices], axis=(0, 1, 2, 3))
+        train_std = torch.std(
+            dataset.observations[train_subset.indices], axis=(0, 1, 2, 3))
+
+        # save normalization values for future
+        dataset_dirname = os.path.dirname(data_path)
+        dataset_basename = '.'.join(
+            os.path.basename(data_path).split('.')[:-1])
+        torch.save(train_mean, os.path.join(dataset_dirname,
+                                            f'{dataset_basename}_mean_s{seed}.pt'))
+        torch.save(train_std, os.path.join(dataset_dirname,
+                                           f'{dataset_basename}_std_s{seed}.pt'))
+
+        # apply normalization on full dataset
+        dataset.observations -= train_mean
+        dataset.observations /= train_std
+
+    # convert rewards to returns
+    if sum_rewards:
+        returns = torch.zeros_like(dataset.rewards)
+        returns += torch.sum(dataset.rewards, axis=1)[:, None]
+        dataset.rewards = returns
+
+    # convert reward values (-1,0,1) into "classes" (0,1,2)
+    dataset.rewards += 1
+
+    # prepare batches
+    train_loader = DataLoader(train_subset, batch_size=batch_size)
+    valid_loader = DataLoader(valid_subset, batch_size=batch_size)
+
+    return train_loader, valid_loader
 
 
 def episodes_to_tensors(episodes, action_size, verbose=False, pad_val=10.):
@@ -84,6 +119,36 @@ def save_trajectories(trajectories, base_dir, agent_dir, action_size, pad_val=10
     torch.save(dataset, full_path)
 
 
+def find_activations(observations, actions, forward_action=2, target='prize'):
+    '''
+    Find steps at which the agent activated a target object by stepping onto it.
+
+    observations - tensor of shape (N, S, H, W, C)
+    actions - tensor of shape (N, S, A)
+    target – one of {trigger|prize}
+
+    return: binary mask (N, S)
+    '''
+
+    target_color = None
+    if target == 'prize':
+        target_color = [255, 76, 249]  # pink
+    if target == 'trigger':
+        target_color = [255, 76, 76]  # red
+
+    N, S, H, W, _ = observations.shape
+    center_h = H // 2
+    center_w = W // 2
+    out_shape = (N, S)
+
+    centers = observations[:, :, center_h, center_w, :]  # N, S, C
+    action_scalars = torch.argmax(actions, axis=-1)  # N, S
+    trigger_ahead = (centers == torch.tensor(target_color)).all(axis=-1)
+    going_forward = (action_scalars == forward_action)
+
+    return torch.logical_and(trigger_ahead, going_forward, out=torch.empty(out_shape, dtype=torch.uint8))
+
+
 def normalize_observations(dataset):
     mean = torch.mean(dataset.observations, axis=(0, 1, 2, 3))
     std = torch.std(dataset.observations, axis=(0, 1, 2, 3))
@@ -94,35 +159,21 @@ def normalize_observations(dataset):
     return mean, std
 
 
-# TODO: choose validation indices first, and then use them
-# to count normalization values (mean, std) only on the train subset
-def get_data_loaders(dataset, batch_size=1024, validation_subset=0, seed=42, verbose=False):
-
-    mean, std = normalize_observations(dataset)
+def validation_split(dataset, validation_subset, seed=42):
 
     if validation_subset > 0:
         n_total_samples = len(dataset)
         n_train_samples = math.floor(n_total_samples * (1-validation_subset))
         n_valid_samples = n_total_samples - n_train_samples
 
-        train_dataset, valid_dataset = random_split(
+        train_subset, valid_subset = random_split(
             dataset,
             [n_train_samples, n_valid_samples],
             generator=torch.Generator().manual_seed(seed)
         )  # reproducible results
 
-        train_loader = DataLoader(train_dataset, batch_size=batch_size)
-        valid_loader = DataLoader(valid_dataset, batch_size=batch_size)
-
-        if verbose:
-            print('Train set size:', len(train_dataset), 'samples')
-            print('Train set:', len(train_loader), 'batches')
-            print('Validation set size:', len(valid_dataset), 'samples')
-            print('Validation set:', len(valid_loader), 'batches')
     else:
-        train_loader = DataLoader(dataset, batch_size=batch_size)
-        valid_loader = None
-        if verbose:
-            print('Prepared:', len(train_loader), 'batches')
+        train_subset = dataset
+        valid_subset = None
 
-    return train_loader, valid_loader
+    return train_subset, valid_subset
