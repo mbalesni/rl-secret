@@ -9,9 +9,10 @@ import random
 import wandb
 from timing import Timing
 from tqdm import tqdm
+import matplotlib.pyplot as plt
 
 from reward_predictor import RewardPredictor
-from trajectories import load_trajectories, get_data_loaders
+from trajectories import preprocess_dataset, find_activations
 
 PAD_VAL = 10
 ACTION_SPACE_SIZE = 3
@@ -23,18 +24,13 @@ def evaluate(model, criterion, data_loader, device, timing, verbose=False):
     accuracies = []
 
     for batch_idx, batch in enumerate(data_loader):
-        observations, actions, rewards = batch
+        observations, actions, returns, indices = batch
 
         with Timing(timing, 'time_eval_preprocess'):
             observations = observations.transpose(
                 2, 4).transpose(0, 1).to(device)
             actions = actions.transpose(0, 1).to(device)
-            rewards = rewards.transpose(0, 1).to(device)
-
-            returns = torch.zeros_like(rewards)
-            # return for each episode in batch
-            returns += torch.sum(rewards, axis=0)[None, :]
-            returns += 1  # turns values (-1,0,1) into "classes" (0,1,2)
+            returns = returns.transpose(0, 1).to(device)
 
         with Timing(timing, 'time_eval_run_inference'):
             output = model(observations, actions)
@@ -56,7 +52,7 @@ def evaluate(model, criterion, data_loader, device, timing, verbose=False):
 
         del observations
         del actions
-        del rewards
+        del returns
         del output
 
     mean_loss = sum(losses) / len(losses)
@@ -74,16 +70,18 @@ def evaluate(model, criterion, data_loader, device, timing, verbose=False):
 
 @click.command()
 @click.option('--note', type=str, help='message to explain how is this run different', required=True)
-@click.option('--data', type=click.Path(exists=True), help='path to trajectories dataset', required=True)
+@click.option('--data-path', type=click.Path(exists=True), help='path to trajectories dataset', required=True)
 @click.option('--seed', type=int, default=42, help='random seed used')
 @click.option('--log-frequency', type=int, default=5e1, help='logging frequency, iterations')
 @click.option('--learning-rate', type=float, default=3e-3, help='goal learning rate')
 @click.option('--epochs', type=int, default=10, help='number of epochs to train for')
 @click.option('--batch-size', default=128, help='training batch size')
+@click.option('--attention-threshold', default=0.2, help='threshold attention weight discretization')
 @click.option('--valid-size', type=float, default=0.2, help='proportion of validation set')
 @click.option('--use-wandb/--no-wandb', default=True)
-def train(note, data, seed, log_frequency,
-          learning_rate, epochs, batch_size, valid_size, use_wandb):
+def train(note, data_path, seed, log_frequency,
+          learning_rate, epochs, batch_size, 
+          attention_threshold, valid_size, use_wandb):
 
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
@@ -94,8 +92,9 @@ def train(note, data, seed, log_frequency,
                notes=note,
                mode='online' if use_wandb else 'disabled',
                config=dict(
+                   attention_threshold=attention_threshold,
                    batch_size=batch_size,
-                   data=data,
+                   data_path=data_path,
                    epochs=epochs,
                    learning_rate=learning_rate,
                    seed=seed,
@@ -110,13 +109,30 @@ def train(note, data, seed, log_frequency,
     np.random.seed(seed)
     random.seed(seed)
 
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
     # data
-    dataset = load_trajectories(data)
-    train_loader, valid_loader = get_data_loaders(
-        dataset, batch_size, valid_size)
+    dataset = torch.load(data_path)
+    trigger_activations = find_activations(
+        dataset.observations, dataset.actions, target='trigger').to(device)
+    # indices of steps preceding activating trigger
+    trigger_activations_indices = torch.argmax(
+        trigger_activations, axis=-1).to(device)
+    prize_activations = find_activations(
+        dataset.observations, dataset.actions, target='prize')
+    # indices of steps preceding taking prize
+    prize_activations_indices = torch.argmax(prize_activations, axis=-1)
+    # mask for episodes where prizes were taken
+    episodes_with_trigger_mask = torch.sum(trigger_activations, axis=-1).to(device)
+    episodes_with_prize_mask = torch.sum(prize_activations, axis=-1).to(device)
+    train_loader, valid_loader = preprocess_dataset(
+        dataset, data_path, batch_size=batch_size, valid_size=valid_size, seed=seed)
+
+    seq_len = dataset.observations.shape[1]
+    attention_weights_global = torch.zeros(
+        (batch_size, seq_len*2+1), device=device)  # N, S*2
 
     # model
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     class_weights = torch.tensor([0.499, 0.02, 0.499]).to(device)
     model = RewardPredictor(
         OBSERVATION_SPACE_DIMS, ACTION_SPACE_SIZE, device, verbose=False).to(device)
@@ -138,7 +154,9 @@ def train(note, data, seed, log_frequency,
         pbar = tqdm(train_loader)
 
         for batch_idx, batch in enumerate(pbar):
-            observations, actions, rewards = batch
+            observations, actions, returns, indices = batch
+
+            N = observations.shape[0]
 
             timing = dict()
 
@@ -146,15 +164,11 @@ def train(note, data, seed, log_frequency,
                 observations = observations.transpose(
                     2, 4).transpose(0, 1).to(device)
                 actions = actions.transpose(0, 1).to(device)
-                rewards = rewards.transpose(0, 1).to(device)
-
-                returns = torch.zeros_like(rewards)
-                # return for each episode in batch
-                returns += torch.sum(rewards, axis=0)[None, :]
-                returns += 1  # turns values (-1,0,1) into "classes" (0,1,2)
+                returns = returns.transpose(0, 1).to(device)
 
             with Timing(timing, 'time_run_inference'):
-                output = model(observations, actions)
+                output, attention_output = model(
+                    observations, actions, output_attention=True)
 
             # Reshape output for K-dimensional CrossEntropy loss
             with Timing(timing, 'time_optimize_model'):
@@ -185,14 +199,67 @@ def train(note, data, seed, log_frequency,
                 acc = torch.sum(masked_preds == masked_returns) / \
                     masked_returns.numel()
 
+                # credit assignment ground truth
+                trigger_activations_batch = trigger_activations[indices]
+                trigger_activations_indices_batch = trigger_activations_indices[indices]
+                # moments at which we want to evaluate attention
+                prize_activations_batch = prize_activations_indices[indices]
+                # mask to zero out attention in episodes without touching prize
+                prize_episodes_mask_batch = episodes_with_prize_mask[indices]
+                trigger_episodes_mask_batch = episodes_with_trigger_mask[indices]
+
+                # for some weird reason, attention_matrices[:, prize_activations_batch] results in [N, N, S] rather than [N, S]
+                # fixed with help of: https://discuss.pytorch.org/t/selecting-element-on-dimension-
+                # from-list-of-indexes/36319/2?u=nick-baliesnyi
+                attention_vals = attention_output[torch.arange(
+                    N), prize_activations_batch]
+                # zero out episodes where prize wasn't touched
+                attention_vals *= prize_episodes_mask_batch[:, None]
+
+                attention_indices = torch.arange(0, seq_len) + seq_len
+                attention_indices = attention_indices.repeat(
+                    N, 1).to(device)
+                attention_indices -= trigger_activations_indices_batch[:, None]
+
+                added_values = torch.zeros_like(attention_weights_global)
+                attention_weights_global += added_values.scatter(
+                    1, attention_indices, attention_vals)
+
+                attention_discrete = torch.gt(attention_vals, attention_threshold, out=torch.empty(
+                    attention_vals.shape, dtype=torch.uint8, device=device))
+                true_positives = torch.sum(torch.logical_and(
+                    attention_discrete, trigger_activations_batch))
+
+                # TODO: evaluate on the whole dataset
+                attention_precision = true_positives / torch.sum(attention_discrete)
+                N_relevant_recall_episodes = torch.sum(torch.logical_and(prize_episodes_mask_batch, trigger_episodes_mask_batch))
+
+                attention_recall = true_positives / N_relevant_recall_episodes
+
+                print(f'attention paid somewhere in batch (N={N})', torch.sum(attention_discrete))
+                print(f'true positives in batch (N={N})', true_positives)
+                print(f'trigger_activations in batch (N={N})', torch.sum(trigger_activations_batch))
+
+            weights_averaged = torch.sum(
+                attention_weights_global, axis=0) / (N)
+            attention_weights_global *= 0
+            x_axis = torch.arange(weights_averaged.shape[0]) - seq_len
+            plt.xlabel('Relative step in trajectory (0 - activating trigger)')
+            plt.ylabel('Average attention weights')
+            plt.plot(x_axis.cpu(), weights_averaged.cpu())
+
             wandb.log({
                 'loss': loss,
                 'acc': acc,
                 'val_loss': val_loss,
                 'val_acc': val_acc,
                 'epoch': epoch,
+                'average_attention': plt,
+                'ca_precision': attention_precision,
+                'ca_recall': attention_recall,
                 **{k: v['time'] / v['count'] for k, v in timing.items()}
             }, )
+            plt.cla()
             timing = dict()
 
             pbar.set_postfix_str(
@@ -202,7 +269,7 @@ def train(note, data, seed, log_frequency,
 
             del observations
             del actions
-            del rewards
+            del returns
             del output
             del preds
 
