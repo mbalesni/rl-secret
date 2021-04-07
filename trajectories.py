@@ -20,26 +20,33 @@ class TrajectoriesDataset(Dataset):
         return (self.observations[idx, :], self.actions[idx, :], self.rewards[idx, :], idx)
 
 
-def preprocess_dataset(dataset, data_path, batch_size=128, valid_size=0.2, seed=42, sum_rewards=True, normalize=True):
+def preprocess_dataset(dataset, data_path, batch_size=128, valid_size=0.2, seed=42,
+                       sum_rewards=True, eval_mode=False, path_to_mean=None, path_to_std=None, normalize=True):
 
-    train_subset, valid_subset = validation_split(
-        dataset, valid_size, seed=seed)
+    if not eval_mode:
+        train_subset, valid_subset = validation_split(
+            dataset, valid_size, seed=seed)
 
     if normalize:
-        # calculate normalization values on train subset
-        train_mean = torch.mean(
-            dataset.observations[train_subset.indices], axis=(0, 1, 2, 3))
-        train_std = torch.std(
-            dataset.observations[train_subset.indices], axis=(0, 1, 2, 3))
 
-        # save normalization values for future
-        dataset_dirname = os.path.dirname(data_path)
-        dataset_basename = '.'.join(
-            os.path.basename(data_path).split('.')[:-1])
-        torch.save(train_mean, os.path.join(dataset_dirname,
-                                            f'{dataset_basename}_mean_s{seed}.pt'))
-        torch.save(train_std, os.path.join(dataset_dirname,
-                                           f'{dataset_basename}_std_s{seed}.pt'))
+        if not eval_mode:
+            # calculate normalization values on train subset
+            train_mean = torch.mean(
+                dataset.observations[train_subset.indices], axis=(0, 1, 2, 3))
+            train_std = torch.std(
+                dataset.observations[train_subset.indices], axis=(0, 1, 2, 3))
+
+            # save normalization values for future
+            dataset_dirname = os.path.dirname(data_path)
+            dataset_basename = '.'.join(
+                os.path.basename(data_path).split('.')[:-1])
+            torch.save(train_mean, os.path.join(dataset_dirname,
+                                                f'{dataset_basename}_mean_s{seed}.pt'))
+            torch.save(train_std, os.path.join(dataset_dirname,
+                                               f'{dataset_basename}_std_s{seed}.pt'))
+        else:
+            train_mean = torch.load(path_to_mean)
+            train_std = torch.load(path_to_std)
 
         # apply normalization on full dataset
         dataset.observations -= train_mean
@@ -55,10 +62,14 @@ def preprocess_dataset(dataset, data_path, batch_size=128, valid_size=0.2, seed=
     dataset.rewards += 1
 
     # prepare batches
-    train_loader = DataLoader(train_subset, batch_size=batch_size)
-    valid_loader = DataLoader(valid_subset, batch_size=batch_size)
+    if not eval_mode:
+        train_loader = DataLoader(train_subset, batch_size=batch_size)
+        valid_loader = DataLoader(valid_subset, batch_size=batch_size)
 
-    return train_loader, valid_loader
+        return train_loader, valid_loader
+    else:
+        data_loader = DataLoader(dataset, batch_size=batch_size)
+        return data_loader
 
 
 def episodes_to_tensors(episodes, action_size, verbose=False, pad_val=10.):
