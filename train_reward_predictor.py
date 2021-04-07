@@ -58,8 +58,12 @@ def evaluate(model, criterion, data_loader, device, timing, ca_gt, verbose=False
 
             loss = criterion(output, returns)
             preds = output.argmax(dim=1)
-            masked_preds = preds[returns != PAD_VAL]
-            masked_returns = returns[returns != PAD_VAL]
+
+            # don't take padded timesteps into account
+            padding_mask = actions.transpose(0, 1)[:, :, 0] != PAD_VAL
+            masked_preds = preds[padding_mask]
+            masked_returns = returns[padding_mask]
+
             acc = torch.sum(masked_preds == masked_returns) / \
                 masked_returns.numel()
 
@@ -84,8 +88,9 @@ def evaluate(model, criterion, data_loader, device, timing, ca_gt, verbose=False
             rel_timesteps -= trigger_timesteps_batch[:, None]
 
             # scatter the batch's attention values over a relative timestep matrix (N, S*2+1)
-            # normalize it *now* because not all batches might be the same size N
-            rel_attention_vals_batch = torch.zeros_like(rel_attention_vals).scatter(1, rel_timesteps, attention_vals) / N
+            # normalize it *now* because later we won't know the number of relevant episodes
+            n_relevant_episodes = torch.sum(torch.logical_and(prize_episodes_mask_batch, trigger_episodes_mask_batch))
+            rel_attention_vals_batch = torch.zeros_like(rel_attention_vals).scatter(1, rel_timesteps, attention_vals) / n_relevant_episodes
 
             # Compute credit assignment precision/recall #
 
@@ -94,7 +99,7 @@ def evaluate(model, criterion, data_loader, device, timing, ca_gt, verbose=False
             true_positives = torch.sum(torch.logical_and(attention_discrete, trigger_activations_batch))
 
             ca_precision = true_positives / torch.sum(attention_discrete)
-            ca_recall = true_positives / torch.sum(torch.logical_and(prize_episodes_mask_batch, trigger_episodes_mask_batch))
+            ca_recall = true_positives / n_relevant_episodes
 
         losses.append(loss.item())
         accuracies.append(acc.item())
@@ -282,7 +287,7 @@ def train(note, data_path, seed, seeds, log_frequency,
                                                                              device, timing, ca_gt)
 
                     preds = output.argmax(dim=1)
-                    masked_preds = preds[returns != PAD_VAL]
+                    masked_preds = preds[returns != PAD_VAL]  # TODO: fix this padding mask (make as in evaluation)
                     masked_returns = returns[returns != PAD_VAL]
                     acc = torch.sum(masked_preds == masked_returns) / masked_returns.numel()
 
@@ -308,7 +313,8 @@ def train(note, data_path, seed, seeds, log_frequency,
                     rel_timesteps -= trigger_timesteps_batch[:, None]
 
                     # scatter the batch's attention values over a relative timestep matrix (N, S*2+1)
-                    rel_attention_vals_batch = torch.zeros_like(rel_attention_vals).scatter(1, rel_timesteps, attention_vals)
+                    n_relevant_episodes = torch.sum(torch.logical_and(prize_episodes_mask_batch, trigger_episodes_mask_batch))
+                    rel_attention_vals_batch = torch.zeros_like(rel_attention_vals).scatter(1, rel_timesteps, attention_vals) / n_relevant_episodes
                     rel_attention_vals += rel_attention_vals_batch
 
                     # Compute credit assignment precision/recall #
@@ -319,9 +325,9 @@ def train(note, data_path, seed, seeds, log_frequency,
                         attention_discrete, trigger_activations_batch))
 
                     ca_precision = true_positives / torch.sum(attention_discrete)
-                    ca_recall = true_positives / torch.sum(torch.logical_and(prize_episodes_mask_batch, trigger_episodes_mask_batch))
+                    ca_recall = true_positives / n_relevant_episodes
 
-                    rel_attention_vals_avg = torch.sum(rel_attention_vals, axis=0) / (N)
+                    rel_attention_vals_avg = torch.sum(rel_attention_vals, axis=0)
                     rel_attention_vals *= 0
 
                 with Timing(timing, 'time_draw_ca_plots'):
@@ -330,12 +336,12 @@ def train(note, data_path, seed, seeds, log_frequency,
 
                     x_axis = (torch.arange(rel_attention_vals_avg.shape[0]) - seq_len).cpu()
 
-                    axes[0].set_title('Training')
+                    axes[0].set_title('Training (single batch)')
                     axes[0].set_xlabel('Relative step in trajectory (0 - activating trigger)')
                     axes[0].set_ylabel('Average attention weights')
                     axes[0].plot(x_axis, rel_attention_vals_avg.cpu())
 
-                    axes[1].set_title('Validation')
+                    axes[1].set_title('Validation (average across batches)')
                     axes[1].set_xlabel('Relative step in trajectory (0 - activating trigger)')
                     axes[1].set_ylabel('Average attention weights')
                     axes[1].plot(x_axis, val_rel_attention_vals_avg.cpu())
