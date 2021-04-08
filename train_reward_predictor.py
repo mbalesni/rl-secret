@@ -287,8 +287,10 @@ def train(note, data_path, seed, seeds, log_frequency,
                                                                              device, timing, ca_gt)
 
                     preds = output.argmax(dim=1)
-                    masked_preds = preds[returns != PAD_VAL]  # TODO: fix this padding mask (make as in evaluation)
-                    masked_returns = returns[returns != PAD_VAL]
+
+                    padding_mask = actions.transpose(0, 1)[:, :, 0] != PAD_VAL
+                    masked_preds = preds[padding_mask]
+                    masked_returns = returns[padding_mask]
                     acc = torch.sum(masked_preds == masked_returns) / masked_returns.numel()
 
                     # Compute credit assignment average graph #
