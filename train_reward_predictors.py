@@ -15,8 +15,65 @@ from reward_predictor import RewardPredictor
 from trajectories import preprocess_dataset, find_activations
 
 PAD_VAL = 10
-ACTION_SPACE_SIZE = 3
-OBSERVATION_SPACE_DIMS = (3, 24, 24)
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
+def run_ca_evaluation(model_path, data_path, observations_mean_path, observations_std_path, wandb, attention_threshold, batch_size):
+
+    # 1. Load and pre-process data
+    dataset = torch.load(data_path)
+    dataset_size = dataset.observations.shape[0]
+
+    # global variables used in other parts
+    seq_len = dataset.observations.shape[1]
+    criterion = nn.CrossEntropyLoss(ignore_index=PAD_VAL)  # will be ignored
+    timing = dict()  # will be ignored
+
+    # credit assignment ground truths
+    trigger_activations = find_activations(dataset.observations, dataset.actions, target='trigger').to(device)  # N, S
+    prize_activations = find_activations(dataset.observations, dataset.actions, target='prize')  # N, S
+
+    trigger_activations_indices = torch.argmax(trigger_activations, axis=-1).to(device)  # (N,) timesteps preceding trigger activation
+    prize_activations_indices = torch.argmax(prize_activations, axis=-1)  # (N,) timesteps preceding taking prize
+
+    episodes_with_prize_mask = torch.sum(prize_activations, axis=-1).to(device)  # mask for episodes where prizes were taken
+    episodes_with_trigger_mask = torch.sum(trigger_activations, axis=-1).to(device)  # (N, )
+
+    ca_gt = {
+        'attention_threshold': attention_threshold,
+        'batch_size': batch_size,
+        'episodes_with_trigger_mask': episodes_with_trigger_mask,
+        'episodes_with_prize_mask': episodes_with_prize_mask,
+        'seq_len': seq_len,
+        'trigger_activations': trigger_activations,
+        'trigger_timesteps': trigger_activations_indices,
+        'prize_activations': prize_activations,
+        'prize_timesteps': prize_activations_indices,
+    }
+
+    data_loader = preprocess_dataset(dataset, data_path, sum_rewards=True, normalize=True,
+                                     eval_mode=True, path_to_mean=observations_mean_path, path_to_std=observations_std_path)
+
+    # 3. Evaluate each model on the data
+    model = torch.load(model_path).to(device)
+    _, acc, ca_precision, ca_recall, rel_attention_vals = evaluate(model, criterion, data_loader, device, timing, ca_gt)
+
+    fig, axes = plt.subplots(1, 1, figsize=(6, 6))
+    x_axis = (torch.arange(rel_attention_vals.shape[0]) - seq_len).cpu()
+
+    axes.set_title(f'Evaluation ({dataset_size} trajectories)')
+    axes.set_xlabel('Relative step in trajectory (0 - activating trigger)')
+    axes.set_ylabel('Average attention weights')
+    axes.plot(x_axis, rel_attention_vals.cpu())
+
+    # 4. Log results to Wandb
+
+    wandb.log({
+        'test_average_attention': wandb.Image(plt),
+        'test_acc': acc,
+        'test_ca_precision': ca_precision,
+        'test_ca_recall': ca_recall,
+    })
 
 
 def evaluate(model, criterion, data_loader, device, timing, ca_gt, verbose=False):
@@ -131,8 +188,11 @@ def evaluate(model, criterion, data_loader, device, timing, ca_gt, verbose=False
 
 
 @click.command()
-@click.option('--note', type=str, help='message to explain how is this run different', required=True)
+@click.option('--agent', type=str, required=True)
+@click.option('--group', type=str, required=True)
+@click.option('--note', type=str, help='message to explain how is this run different')
 @click.option('--data-path', type=click.Path(exists=True), help='path to trajectories dataset', required=True)
+@click.option('--test-path', type=click.Path(exists=True), help='path to test trajectories dataset', required=True)
 @click.option('--seed', type=int, default=42, help='random seed used')
 @click.option('--seeds', type=int, default=1, help='# of random seeds used')
 @click.option('--log-frequency', type=int, default=5e1, help='logging frequency, iterations')
@@ -142,7 +202,7 @@ def evaluate(model, criterion, data_loader, device, timing, ca_gt, verbose=False
 @click.option('--attention-threshold', default=0.2, help='threshold attention weight discretization')
 @click.option('--valid-size', type=float, default=0.2, help='proportion of validation set')
 @click.option('--use-wandb/--no-wandb', default=True)
-def train(note, data_path, seed, seeds, log_frequency,
+def train(agent, group, note, data_path, test_path, seed, seeds, log_frequency,
           learning_rate, epochs, batch_size,
           attention_threshold, valid_size, use_wandb):
 
@@ -150,8 +210,6 @@ def train(note, data_path, seed, seeds, log_frequency,
     torch.backends.cudnn.benchmark = False
 
     wandb.login()
-
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # data
     dataset = torch.load(data_path)
@@ -182,26 +240,28 @@ def train(note, data_path, seed, seeds, log_frequency,
         'prize_timesteps': prize_timesteps,
     }
 
-    train_loader, valid_loader = preprocess_dataset(dataset, data_path,
-                                                    batch_size=batch_size,
-                                                    valid_size=valid_size,
-                                                    seed=seed)
+    train_loader, valid_loader, obs_mean_path, obs_std_path = preprocess_dataset(dataset, data_path,
+                                                                                 batch_size=batch_size,
+                                                                                 valid_size=valid_size,
+                                                                                 seed=seed)
 
     # model
     class_weights = torch.tensor([0.499, 0.02, 0.499]).to(device)
 
     for i_seed in range(seed, seed+seeds):
-        print(f"> Experiment Seed {i_seed}")
 
         wandb.init(project='attentional_fw_baselines',
                    entity='ut-rl-credit',
-                   tags=['prod'],
-                   notes=note,
+                   notes='Reward predictor',
+                   group=group,
+                   tags=['SECRET', 'verification'],
                    mode='online' if use_wandb else 'disabled',
                    config=dict(
+                       agent=agent,
                        attention_threshold=attention_threshold,
                        batch_size=batch_size,
                        data_path=data_path,
+                       test_path=test_path,
                        epochs=epochs,
                        learning_rate=learning_rate,
                        seed=i_seed,
@@ -209,6 +269,8 @@ def train(note, data_path, seed, seeds, log_frequency,
                    ))
         # Upload models at the end of training
         save_dir = wandb.run.dir if use_wandb else './'
+        BEST_MODEL_PATH = os.path.join(save_dir, 'best_model.pt')
+        FINAL_MODEL_PATH = os.path.join(save_dir, 'final_model.pt')
         wandb.save(os.path.join(save_dir, "*.pt"))
 
         torch.cuda.manual_seed(i_seed)
@@ -216,8 +278,9 @@ def train(note, data_path, seed, seeds, log_frequency,
         np.random.seed(i_seed)
         random.seed(i_seed)
 
-        model = RewardPredictor(
-            OBSERVATION_SPACE_DIMS, ACTION_SPACE_SIZE, device, verbose=False).to(device)
+        obs_space_dims = [dataset.observations.shape[-1], *dataset.observations.shape[2:-1]]
+        act_space_size = dataset.actions.shape[-1]
+        model = RewardPredictor(obs_space_dims, act_space_size, device, verbose=False).to(device)
 
         wandb.watch(model)
 
@@ -233,14 +296,13 @@ def train(note, data_path, seed, seeds, log_frequency,
 
         criterion = nn.CrossEntropyLoss(weight=class_weights, ignore_index=PAD_VAL)
 
-        for epoch in range(epochs):
-            print(f"> Epoch {epoch+1}/{epochs}", end=' ')
+        print(f'Training reward predictor seed={i_seed}...\n')
+
+        for epoch in tqdm(range(epochs)):
 
             losses = []
 
-            pbar = tqdm(train_loader)
-
-            for batch_idx, batch in enumerate(pbar):
+            for batch_idx, batch in enumerate(train_loader):
                 observations, actions, returns, indices = batch
 
                 trigger_activations_batch = trigger_activations[indices]
@@ -359,8 +421,7 @@ def train(note, data_path, seed, seeds, log_frequency,
                         best_val_recall = val_ca_recall
                         best_val_acc = val_acc
                         best_val_loss = val_loss
-                        torch.save(model, os.path.join(
-                            save_dir, f'model_r{val_ca_recall:.3f}_p{val_ca_precision:.3f}_a{val_acc:.3f}_l{val_loss:.3f}.pt'))
+                        torch.save(model, BEST_MODEL_PATH)
 
                 wandb.log({
                     'average_attention': wandb_plot_image,
@@ -378,9 +439,9 @@ def train(note, data_path, seed, seeds, log_frequency,
                 plt.close()
                 timing = dict()
 
-                pbar.set_postfix_str(
-                    f'''loss: {loss:.3f}, acc: {acc:.3f}, val_loss: {val_loss:.3f}, val_acc: {val_acc:.3f}, 
-                        val_ca_p: {val_ca_precision:.3f}, val_ca_r: {val_ca_recall:.3f}''')
+                # pbar.set_postfix_str(
+                #     f'''loss: {loss:.3f}, acc: {acc:.3f}, val_loss: {val_loss:.3f}, val_acc: {val_acc:.3f},
+                #         val_ca_p: {val_ca_precision:.3f}, val_ca_r: {val_ca_recall:.3f}''')
 
                 model.train()
 
@@ -396,7 +457,14 @@ def train(note, data_path, seed, seeds, log_frequency,
             mean_loss = sum(losses) / len(losses)
             scheduler.step(mean_loss)
 
-        torch.save(model, os.path.join(save_dir, 'final_model.pt'))
+        torch.save(model, FINAL_MODEL_PATH)
+        del model
+
+        print(f'Evaluating reward predictor seed={i_seed}...\n')
+        # Evaluate best model on the test set and log results
+        # TODO: change to best model
+        run_ca_evaluation(FINAL_MODEL_PATH, test_path, obs_mean_path, obs_std_path, wandb, attention_threshold, batch_size)
+
         wandb.finish()
 
 

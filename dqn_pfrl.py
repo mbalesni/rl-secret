@@ -3,9 +3,6 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-import gym
-import numpy as np
-import wandb
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -45,7 +42,7 @@ class DQN_PFRL_ACTOR:
 
     def __init__(self, screen_height, screen_width, n_channels, n_actions, eps_start=1,
                  eps_end=0.01, eps_test=0.001, eps_decay=250_000, eps_const=None, gamma=0.999,
-                 batch_size=32, target_update=2000, learning_rate=0.00025, buffer_size=1_000_000, 
+                 batch_size=32, target_update=2000, learning_rate=0.00025, buffer_size=1_000_000,
                  update_interval=1, update_start=5000, env=None):
         self.n_actions = n_actions
         self.env = env
@@ -67,7 +64,7 @@ class DQN_PFRL_ACTOR:
         self.explorer = pfrl.explorers.LinearDecayEpsilonGreedy(
             eps_start, eps_end, eps_decay, random_action_func=env.action_space.sample)
         self.memory = pfrl.replay_buffers.PrioritizedReplayBuffer(buffer_size)
-        
+
         self.phi = lambda x: torch.from_numpy(x.transpose((2, 0, 1))).to(device, dtype=torch.float)
         self.gpu = 0
 
@@ -86,4 +83,3 @@ class DQN_PFRL_ACTOR:
             max_grad_norm=1.,
 
         )
-    

@@ -23,6 +23,9 @@ class TrajectoriesDataset(Dataset):
 def preprocess_dataset(dataset, data_path, batch_size=128, valid_size=0.2, seed=42,
                        sum_rewards=True, eval_mode=False, path_to_mean=None, path_to_std=None, normalize=True):
 
+    observations_mean_path = None
+    observations_std_path = None
+
     if not eval_mode:
         train_subset, valid_subset = validation_split(
             dataset, valid_size, seed=seed)
@@ -40,10 +43,12 @@ def preprocess_dataset(dataset, data_path, batch_size=128, valid_size=0.2, seed=
             dataset_dirname = os.path.dirname(data_path)
             dataset_basename = '.'.join(
                 os.path.basename(data_path).split('.')[:-1])
-            torch.save(train_mean, os.path.join(dataset_dirname,
-                                                f'{dataset_basename}_mean_s{seed}.pt'))
-            torch.save(train_std, os.path.join(dataset_dirname,
-                                               f'{dataset_basename}_std_s{seed}.pt'))
+
+            observations_mean_path = os.path.join(dataset_dirname, f'{dataset_basename}_mean.pt')
+            observations_std_path = os.path.join(dataset_dirname, f'{dataset_basename}_std.pt')
+
+            torch.save(train_mean, observations_mean_path)
+            torch.save(train_std, observations_std_path)
         else:
             train_mean = torch.load(path_to_mean)
             train_std = torch.load(path_to_std)
@@ -66,7 +71,7 @@ def preprocess_dataset(dataset, data_path, batch_size=128, valid_size=0.2, seed=
         train_loader = DataLoader(train_subset, batch_size=batch_size)
         valid_loader = DataLoader(valid_subset, batch_size=batch_size)
 
-        return train_loader, valid_loader
+        return train_loader, valid_loader, observations_mean_path, observations_std_path
     else:
         data_loader = DataLoader(dataset, batch_size=batch_size)
         return data_loader
@@ -114,7 +119,7 @@ def one_hot_encode_action(action, n_classes=3):
     return one_hot(index, n_classes)
 
 
-def save_trajectories(trajectories, base_dir, agent_dir, action_size, pad_val=10):
+def save_trajectories(recording_name, trajectories, base_dir, action_size, pad_val=10):
     print('Saving experience...')
     # convert list of episodes into PyTorch dataset
     observations, actions, rewards = episodes_to_tensors(
@@ -122,12 +127,14 @@ def save_trajectories(trajectories, base_dir, agent_dir, action_size, pad_val=10
     dataset = TrajectoriesDataset(observations, actions, rewards)
 
     # create a new folder for dataset
-    directory = os.path.join(base_dir, agent_dir, 'trajectories')
+    directory = os.path.join(base_dir, 'trajectories')
     os.makedirs(directory, exist_ok=True)
-    recording_name = f'{len(trajectories)/1000:.2f}K.pt'
+    recording_name = f'{recording_name}.pt'
     full_path = os.path.join(directory, recording_name)
 
     torch.save(dataset, full_path)
+
+    return full_path
 
 
 def find_activations(observations, actions, forward_action=2, target='prize'):
