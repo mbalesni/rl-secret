@@ -98,22 +98,11 @@ def run_ca_evaluation(model_path, data_path,
         return acc, ca_precision, ca_recall, axes, ca_gt, rel_attention_vals
 
 
-def evaluate(model, criterion, data_loader, device, timing, ca_gt, ca_skip_episodes_without_triggers, verbose=False):
-    attention_threshold, seq_len = ca_gt['attention_threshold'], ca_gt['seq_len']
+def forward_batch(model, criterion, batch, device, timing, ca_gt, skip_no_trigger_episodes_precision):
+    observations, actions, returns, indices = batch
 
-    losses = []
-    accuracies = []
-    ca_precisions = []
-    ca_recalls = []
-    y_preds = []
-    y_trues = []
-    rel_attention_vals = torch.zeros((seq_len*2+1), device=device)  # S*2+1
-
-    n_attn_plot_batches = 0
-
-    for batch_idx, batch in enumerate(data_loader):
-        observations, actions, returns, indices = batch
-
+    with Timing(timing, 'time_preprocess'):
+        attention_threshold = ca_gt['attention_threshold']
         trigger_activations_batch = ca_gt['trigger_activations'][indices]
         trigger_timesteps_batch = ca_gt['trigger_timesteps'][indices]
         prize_timesteps_batch = ca_gt['prize_timesteps'][indices]
@@ -122,88 +111,111 @@ def evaluate(model, criterion, data_loader, device, timing, ca_gt, ca_skip_episo
 
         N, seq_len = observations.shape[:2]
 
-        with Timing(timing, 'time_eval_preprocess'):
-            observations = observations.transpose(
-                2, 4).transpose(0, 1).to(device)
-            actions = actions.transpose(0, 1).to(device)
-            returns = returns.transpose(0, 1).to(device)
+        observations = observations.transpose(2, 4).transpose(0, 1).to(device)
+        actions = actions.transpose(0, 1).to(device)
+        returns = returns.transpose(0, 1).to(device)
 
-        with Timing(timing, 'time_eval_run_inference'):
-            output, attention_output = model(observations, actions, output_attention=True)
+    with Timing(timing, 'time_run_inference'):
+        output, attention_output = model(observations, actions, output_attention=True)
+        output = output.permute(0, 2, 1)
+        returns = returns.transpose(0, 1)
 
-        with Timing(timing, 'time_eval_calc_metrics'):
-            # reshape for CrossEntropyLoss
-            output = output.permute(0, 2, 1)
-            returns = returns.transpose(0, 1)
+    with Timing(timing, 'time_calc_batch_metrics'):
+        loss = criterion(output, returns)
+        preds = output.argmax(dim=1)
 
-            loss = criterion(output, returns)
-            preds = output.argmax(dim=1)
+        padding_mask = actions.transpose(0, 1)[:, :, 0] != PAD_VAL
+        masked_preds = preds[padding_mask]
+        masked_returns = returns[padding_mask]
 
-            # don't take padded timesteps into account
-            padding_mask = actions.transpose(0, 1)[:, :, 0] != PAD_VAL
-            masked_preds = preds[padding_mask]
-            masked_returns = returns[padding_mask]
+        # balanced accuracy
+        acc_neg = torch.sum(torch.logical_and(masked_preds == 0, masked_returns == 0)) / torch.sum(masked_returns == 0)
+        acc_zero = torch.sum(torch.logical_and(masked_preds == 1, masked_returns == 1)) / torch.sum(masked_returns == 1)
+        acc_pos = torch.sum(torch.logical_and(masked_preds == 2, masked_returns == 2)) / torch.sum(masked_returns == 2)
+        acc = torch.mean(torch.tensor([acc_neg, acc_zero, acc_pos]))
 
-            # balanced accuracy
-            acc_neg = torch.sum(torch.logical_and(masked_preds == 0, masked_returns == 0)) / torch.sum(masked_returns == 0)
-            acc_zero = torch.sum(torch.logical_and(masked_preds == 1, masked_returns == 1)) / torch.sum(masked_returns == 1)
-            acc_pos = torch.sum(torch.logical_and(masked_preds == 2, masked_returns == 2)) / torch.sum(masked_returns == 2)
-            acc = torch.mean(torch.tensor([acc_neg, acc_zero, acc_pos]))
+        # Compute credit assignment average graph #
 
-            # Compute credit assignment average graph #
+        # extract attention values *when getting prize*
+        # for some weird reason, attention_matrices[:, prize_timesteps_batch] results in [N, N, S] rather than [N, S]
+        # fixed with help of:
+        # https://discuss.pytorch.org/t/selecting-element-on-dimension-from-list-of-indexes/36319/2?u=nick-baliesnyi
+        attention_vals = attention_output[torch.arange(N), prize_timesteps_batch]
 
-            # for some weird reason, attention_matrices[:, prize_timesteps_batch] results in [N, N, S] rather than [N, S]
-            # fixed with help of:
-            # https://discuss.pytorch.org/t/selecting-element-on-dimension-from-list-of-indexes/36319/2?u=nick-baliesnyi
-            attention_vals = attention_output[torch.arange(N), prize_timesteps_batch]
+        # zero out episodes where prize wasn't touched
+        attention_vals *= prize_episodes_mask_batch[:, None]
 
-            # zero out attention for episodes where prize wasn't touched
-            attention_vals *= prize_episodes_mask_batch[:, None]
+        # compute relative timesteps for each episode relative to trigger activation
+        # e.g.
+        # [[-10, -9, -8, ..., 39],
+        # [-25, -24, -24,..., 24],
+        #                     ...]
+        rel_timesteps = torch.arange(0, seq_len) + seq_len
+        rel_timesteps = rel_timesteps.repeat(N, 1).to(device)
+        rel_timesteps -= trigger_timesteps_batch[:, None]
 
-            # compute relative timesteps for each episode relative to trigger activation
-            # e.g.
-            # [[-10, -9, -8, ..., 39],
-            # [-25, -24, -24,..., 24],
-            #                     ...]
-            rel_timesteps = torch.arange(0, seq_len) + seq_len
-            rel_timesteps = rel_timesteps.repeat(
-                N, 1).to(device)
-            rel_timesteps -= trigger_timesteps_batch[:, None]
+        # scatter the batch's attention values over a relative timestep matrix (N, S*2+1)
+        n_episodes_prizes_and_triggers = torch.sum(torch.logical_and(prize_episodes_mask_batch, trigger_episodes_mask_batch))
+        if n_episodes_prizes_and_triggers > 0:
+            rel_attention_vals = torch.zeros((N, seq_len*2+1), device=device).scatter(1, rel_timesteps, attention_vals)
+            rel_attention_vals *= trigger_episodes_mask_batch[:, None]
+            rel_attention_vals = torch.sum(rel_attention_vals, axis=0) / n_episodes_prizes_and_triggers  # (S*2+1)
 
-            # scatter the batch's attention values over a relative timestep matrix (N, S*2+1)
-            # zero out attention when triggers weren't touched
-            # then average over the episodes to get (S*2+1)
-            n_episodes_prizes_and_triggers = torch.sum(torch.logical_and(prize_episodes_mask_batch, trigger_episodes_mask_batch))
-            if n_episodes_prizes_and_triggers > 0:
-                n_attn_plot_batches += 1
-                rel_attention_vals_batch = torch.zeros((N, seq_len*2+1), device=device).scatter(1, rel_timesteps, attention_vals)
-                rel_attention_vals_batch *= trigger_episodes_mask_batch[:, None]
-                rel_attention_vals_batch = torch.sum(rel_attention_vals_batch, axis=0) / n_episodes_prizes_and_triggers  # (S*2+1)
-                rel_attention_vals += rel_attention_vals_batch
+        # Compute credit assignment precision/recall #
+        if skip_no_trigger_episodes_precision:
+            attention_vals *= trigger_episodes_mask_batch[:, None]
 
-            # Compute credit assignment precision/recall #
-            if ca_skip_episodes_without_triggers:
-                attention_vals *= trigger_episodes_mask_batch[:, None]
+        attention_discrete = torch.gt(attention_vals, attention_threshold, out=torch.empty(
+            attention_vals.shape, dtype=torch.uint8, device=device))
+        true_positives = torch.sum(torch.logical_and(
+            attention_discrete, trigger_activations_batch))
 
-            attention_discrete = torch.gt(attention_vals, attention_threshold, out=torch.empty(
-                                          attention_vals.shape, dtype=torch.uint8, device=device))
-            true_positives = torch.sum(torch.logical_and(attention_discrete, trigger_activations_batch))
+        ca_precision = true_positives / torch.sum(attention_discrete)
+        ca_recall = true_positives / n_episodes_prizes_and_triggers
 
-            if torch.sum(attention_discrete) > 0:
-                ca_precision = true_positives / torch.sum(attention_discrete)
-                ca_precisions.append(ca_precision.item())
+        if torch.sum(attention_discrete) == 0:
+            ca_precision = None
+        if n_episodes_prizes_and_triggers == 0:
+            ca_recall = None
 
-            if n_episodes_prizes_and_triggers > 0:
-                ca_recall = true_positives / n_episodes_prizes_and_triggers
-                ca_recalls.append(ca_recall.item())
+    del observations
+    del actions
+    del returns
+    del output
+    del preds
 
-            losses.append(loss.item())
-            accuracies.append(acc.item())
+    return loss, acc, ca_precision, ca_recall, rel_attention_vals, masked_preds, masked_returns
 
-        del observations
-        del actions
-        del returns
-        del output
+
+def evaluate(model, criterion, data_loader, device, timing, ca_gt, ca_skip_episodes_without_triggers, verbose=False):
+    seq_len = ca_gt['seq_len']
+
+    losses = []
+    accuracies = []
+    ca_precisions = []
+    ca_recalls = []
+    y_preds = []
+    y_trues = []
+    n_attn_plot_batches = 0
+    rel_attention_vals = torch.zeros((seq_len*2+1), device=device)  # S*2+1
+
+    for batch in data_loader:
+        loss_batch, acc_batch, ca_precision_batch, ca_recall_batch, \
+            attention_batch, y_preds_batch, y_trues_batch = forward_batch(model, criterion, batch, device, timing,
+                                                                          ca_gt, ca_skip_episodes_without_triggers)
+
+        if ca_precision_batch is not None:
+            ca_precisions.append(ca_precision_batch.item())
+
+        if ca_recall_batch is not None:
+            ca_recalls.append(ca_recall_batch.item())
+            n_attn_plot_batches += 1
+            rel_attention_vals += attention_batch
+
+        losses.append(loss_batch.item())
+        accuracies.append(acc_batch.item())
+        y_preds += list(y_preds_batch.cpu())
+        y_trues += list(y_trues_batch.cpu())
 
     mean_loss = sum(losses) / len(losses)
     mean_acc = sum(accuracies) / len(accuracies)
@@ -215,10 +227,6 @@ def evaluate(model, criterion, data_loader, device, timing, ca_gt, ca_skip_episo
     del accuracies
     del ca_precisions
     del ca_recalls
-
-    if verbose:
-        print('mean_loss:', mean_loss)
-        print('mean_acc:', mean_acc)
 
     return mean_loss, mean_acc, mean_ca_precision, mean_ca_recall, mean_rel_attention_vals, y_preds, y_trues
 
@@ -342,43 +350,21 @@ def train(agent, group, note, data_path, test_path, seed, seeds, log_frequency,
 
             losses = []
 
-            for batch_idx, batch in enumerate(train_loader):
-                observations, actions, returns, indices = batch
-
-                trigger_activations_batch = trigger_activations[indices]
-                trigger_timesteps_batch = trigger_timesteps[indices]
-                prize_timesteps_batch = prize_timesteps[indices]
-                prize_episodes_mask_batch = episodes_with_prize_mask[indices]
-                trigger_episodes_mask_batch = episodes_with_trigger_mask[indices]
-
-                N = observations.shape[0]
+            for batch in train_loader:
 
                 timing = dict()
 
-                with Timing(timing, 'time_preprocess'):
-                    observations = observations.transpose(2, 4).transpose(0, 1).to(device)
-                    actions = actions.transpose(0, 1).to(device)
-                    returns = returns.transpose(0, 1).to(device)
-
-                with Timing(timing, 'time_run_inference'):
-                    output, attention_output = model(observations, actions, output_attention=True)
+                model.train()
+                optimizer.zero_grad()
+                loss_batch, acc_batch, ca_precision_batch, ca_recall_batch, \
+                    attention_batch, _, _ = forward_batch(model, criterion, batch, device,
+                                                          timing, ca_gt, skip_no_trigger_episodes_precision)
+                losses.append(loss_batch.item())
 
                 # Reshape output for K-dimensional CrossEntropy loss
                 with Timing(timing, 'time_optimize_model'):
-                    output = output.permute(0, 2, 1)
-                    returns = returns.transpose(0, 1)
-
-                    # Compute loss
-                    optimizer.zero_grad()
-
-                    loss = criterion(output, returns)
-                    losses.append(loss.item())
-
-                    loss.backward()
-
-                    # Clip to avoid exploding gradient issues
+                    loss_batch.backward()
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1)
-
                     optimizer.step()
 
                 with Timing(timing, 'time_evaluate_model'):
@@ -389,69 +375,17 @@ def train(agent, group, note, data_path, test_path, seed, seeds, log_frequency,
                         _, _ = evaluate(model, criterion, valid_loader,
                                         device, timing, ca_gt, skip_no_trigger_episodes_precision)
 
-                    preds = output.argmax(dim=1)
-
-                    padding_mask = actions.transpose(0, 1)[:, :, 0] != PAD_VAL
-                    masked_preds = preds[padding_mask]
-                    masked_returns = returns[padding_mask]
-
-                    # balanced accuracy
-                    acc_neg = torch.sum(torch.logical_and(masked_preds == 0, masked_returns == 0)) / torch.sum(masked_returns == 0)
-                    acc_zero = torch.sum(torch.logical_and(masked_preds == 1, masked_returns == 1)) / torch.sum(masked_returns == 1)
-                    acc_pos = torch.sum(torch.logical_and(masked_preds == 2, masked_returns == 2)) / torch.sum(masked_returns == 2)
-                    acc = torch.mean(torch.tensor([acc_neg, acc_zero, acc_pos]))
-
-                    # Compute credit assignment average graph #
-
-                    # extract attention values *when getting prize*
-                    # for some weird reason, attention_matrices[:, prize_timesteps_batch] results in [N, N, S] rather than [N, S]
-                    # fixed with help of:
-                    # https://discuss.pytorch.org/t/selecting-element-on-dimension-from-list-of-indexes/36319/2?u=nick-baliesnyi
-                    attention_vals = attention_output[torch.arange(N), prize_timesteps_batch]
-
-                    # zero out episodes where prize wasn't touched
-                    attention_vals *= prize_episodes_mask_batch[:, None]
-
-                    # compute relative timesteps for each episode relative to trigger activation
-                    # e.g.
-                    # [[-10, -9, -8, ..., 39],
-                    # [-25, -24, -24,..., 24],
-                    #                     ...]
-                    rel_timesteps = torch.arange(0, seq_len) + seq_len
-                    rel_timesteps = rel_timesteps.repeat(
-                        N, 1).to(device)
-                    rel_timesteps -= trigger_timesteps_batch[:, None]
-
-                    # scatter the batch's attention values over a relative timestep matrix (N, S*2+1)
-                    n_episodes_prizes_and_triggers = torch.sum(torch.logical_and(prize_episodes_mask_batch, trigger_episodes_mask_batch))
-                    if n_episodes_prizes_and_triggers > 0:
-                        rel_attention_vals_batch = torch.zeros((N, seq_len*2+1), device=device).scatter(1, rel_timesteps, attention_vals)
-                        rel_attention_vals_batch *= trigger_episodes_mask_batch[:, None]
-                        rel_attention_vals_batch = torch.sum(rel_attention_vals_batch, axis=0) / n_episodes_prizes_and_triggers  # (S*2+1)
-
-                    # Compute credit assignment precision/recall #
-                    if skip_no_trigger_episodes_precision:
-                        attention_vals *= trigger_episodes_mask_batch[:, None]
-
-                    attention_discrete = torch.gt(attention_vals, attention_threshold, out=torch.empty(
-                                                  attention_vals.shape, dtype=torch.uint8, device=device))
-                    true_positives = torch.sum(torch.logical_and(
-                                               attention_discrete, trigger_activations_batch))
-
-                    ca_precision = true_positives / torch.sum(attention_discrete)
-                    ca_recall = true_positives / n_episodes_prizes_and_triggers
-
                 with Timing(timing, 'time_draw_ca_plots'):
 
                     # create credit assignment plots
                     fig, axes = plt.subplots(1, 2, figsize=(12.5, 6))
 
-                    x_axis = (torch.arange(rel_attention_vals_batch.shape[0]) - seq_len).cpu()
+                    x_axis = (torch.arange(attention_batch.shape[0]) - seq_len).cpu()
 
                     axes[0].set_title('Training (single batch)')
                     axes[0].set_xlabel('Relative step in trajectory (0 - activating trigger)')
                     axes[0].set_ylabel('Average attention weights')
-                    axes[0].plot(x_axis, rel_attention_vals_batch.cpu())
+                    axes[0].plot(x_axis, attention_batch.cpu())
 
                     axes[1].set_title('Validation (average across batches)')
                     axes[1].set_xlabel('Relative step in trajectory (0 - activating trigger)')
@@ -459,12 +393,13 @@ def train(agent, group, note, data_path, test_path, seed, seeds, log_frequency,
                     axes[1].plot(x_axis, val_rel_attention_vals_avg.cpu())
 
                     wandb_plot_image = wandb.Image(plt)
+                    plt.close('all')
 
-                if val_ca_precision >= best_val_precision and \
-                        val_ca_recall >= best_val_recall and \
-                        val_acc >= best_val_acc and \
-                        val_loss <= best_val_loss:
-                    with Timing(timing, 'time_save_model'):
+                with Timing(timing, 'time_save_model'):
+                    if val_ca_precision >= best_val_precision and \
+                            val_ca_recall >= best_val_recall and \
+                            val_acc >= best_val_acc and \
+                            val_loss <= best_val_loss:
                         best_val_precision = val_ca_precision
                         best_val_recall = val_ca_recall
                         best_val_acc = val_acc
@@ -473,31 +408,21 @@ def train(agent, group, note, data_path, test_path, seed, seeds, log_frequency,
 
                 log_dict = {
                     'average_attention': wandb_plot_image,
-                    'acc': acc,
+                    'acc': acc_batch,
                     'epoch': epoch,
-                    'loss': loss,
+                    'loss': loss_batch,
                     'val_acc': val_acc,
                     'val_ca_precision': val_ca_precision,
                     'val_ca_recall': val_ca_recall,
                     'val_loss': val_loss,
                     **{k: v['time'] / v['count'] for k, v in timing.items()}
                 }
-                if torch.sum(attention_discrete) > 0:
-                    log_dict['ca_precision'] = ca_precision
-                if n_episodes_prizes_and_triggers > 0:
-                    log_dict['ca_recall'] = ca_recall
+                if ca_precision_batch is not None:
+                    log_dict['ca_precision'] = ca_precision_batch
+                if ca_recall_batch is not None:
+                    log_dict['ca_recall'] = ca_recall_batch
 
                 wandb.log(log_dict)
-                plt.close('all')
-                timing = dict()
-
-                model.train()
-
-                del observations
-                del actions
-                del returns
-                del output
-                del preds
 
             # free some GPU memory
             torch.cuda.empty_cache()
