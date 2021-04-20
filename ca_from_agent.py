@@ -35,13 +35,15 @@ def frames_to_video(frames, fps=15):
 @click.option('--note', type=str, help='message to explain how is this run different')
 @click.option('--group', type=str, required=True)
 @click.option('--env-name', type=str, required=True)  # e.g. MiniGrid-Triggers-3x3-T1P1-v0
+@click.option('--epochs', type=int, help='for reward prediction model training', required=True)  # e.g. MiniGrid-Triggers-3x3-T1P1-v0
 @click.option('--seed', type=int, default=42, help='random seed used')
+@click.option('--seeds', type=int, default=5, help='number of reward prediction models')
 @click.option('--log-frequency', type=int, default=5e1, help='logging frequency, episodes')
 @click.option('--episodes', type=int, help='number of episodes to record for', required=True)
 @click.option('--test-episodes', type=int, help='number of test episodes to record for', required=True)
 @click.option('--agents-dir', type=click.Path(exists=True), help='path to agent models', required=True)
 @click.option('--use-wandb/--no-wandb', default=True)
-def record(note, group, env_name, seed, log_frequency, episodes, test_episodes, agents_dir, use_wandb):
+def record(note, group, env_name, epochs, seed, seeds, log_frequency, episodes, test_episodes, agents_dir, use_wandb):
     global trajectories
     global test_trajectories
 
@@ -67,10 +69,14 @@ def record(note, group, env_name, seed, log_frequency, episodes, test_episodes, 
         break
 
     for agent_dir in agent_dirs:
+
+        agent_dir_base = os.path.basename(agent_dir)
+        agent_group = f'{group}_{agent_dir_base}'
+
         wandb.init(entity='ut-rl-credit',
                    project='attentional_fw_baselines',
                    tags=['SECRET', 'verification'],
-                   group=group,
+                   group=agent_group,
                    notes='Collect trajectories, Train & Eval Reward Predictors',
                    mode='online' if use_wandb else 'disabled',
                    config=dict(
@@ -91,124 +97,134 @@ def record(note, group, env_name, seed, log_frequency, episodes, test_episodes, 
             with actor.eval_mode():
 
                 full_agent_dir = os.path.join(agents_base_dir, agent_dir)
+                trajectories_path = os.path.join(full_agent_dir, 'trajectories', 'train.pt')
+                test_trajectories_path = os.path.join(full_agent_dir, 'trajectories', 'test.pt')
 
                 timing = dict()
-                print('\nRecording training trajectories...\n')
-                # collect train set
-                for i_episode in tqdm(range(1, episodes+1)):
-                    trajectories.append([])
+                if not os.path.exists(trajectories_path):
 
-                    observation = env.reset()
-                    frames = [env.render(mode='rgb_array')]
-                    rewards = []
+                    print('\nRecording training trajectories...\n')
+                    # collect train set
+                    for i_episode in tqdm(range(1, episodes+1)):
+                        trajectories.append([])
 
-                    for i_step in count():
-                        partial_observation = observation['image_partial']
+                        observation = env.reset()
+                        frames = [env.render(mode='rgb_array')]
+                        rewards = []
 
-                        with Timing(timing, 'time_choose_act'):
-                            action = actor.act(observation['image'])
+                        for i_step in count():
+                            last_observation = observation['image']
 
-                        with Timing(timing, 'time_perform_act'):
-                            observation, reward, done, _ = env.step(action)
+                            with Timing(timing, 'time_choose_act'):
+                                action = actor.act(last_observation)
 
-                        with Timing(timing, 'time_observe'):
-                            actor.observe(
-                                observation['image'], reward, done, reset=False)
+                            with Timing(timing, 'time_perform_act'):
+                                observation, reward, done, _ = env.step(action)
 
-                        frames.append(env.render(mode='rgb_array'))
-                        rewards.append(reward)
+                            with Timing(timing, 'time_observe'):
+                                actor.observe(
+                                    observation['image'], reward, done, reset=False)
 
-                        # record cropped, *partial* observation for reward-prediction model
-                        step = (partial_observation, action, reward, done)
-                        trajectories[-1].append(step)
+                            frames.append(env.render(mode='rgb_array'))
+                            rewards.append(reward)
 
-                        if done:
-                            logs['episode_returns'].append(sum(rewards))
-                            logs['episode_durations'].append(len(rewards))
-                            break
+                            # record observation for reward-prediction model
+                            step = (last_observation, action, reward, done)
+                            trajectories[-1].append(step)
 
-                    if i_episode > 1 and (i_episode % log_frequency) == 0:
+                            if done:
+                                logs['episode_returns'].append(sum(rewards))
+                                logs['episode_durations'].append(len(rewards))
+                                break
 
-                        avg_duration = np.mean(logs['episode_durations'])
-                        avg_return = torch.mean(torch.tensor(
-                            logs['episode_returns'], device='cpu', dtype=torch.float))
+                        if i_episode > 1 and (i_episode % log_frequency) == 0:
 
-                        wandb.log({
-                            'avg_episode_duration': avg_duration,
-                            'avg_episode_return': avg_return,
-                            'video': frames_to_video(frames),
-                            'episode': i_episode,
-                            'agent_step': actor.cumulative_steps,
-                            'epsilon': actor.explorer.epsilon,
-                            **{k: v['time'] / v['count'] for k, v in timing.items()}
-                        }, )
-                        logs['episode_durations'] = []
-                        logs['episode_returns'] = []
-                        timing = dict()
+                            avg_duration = np.mean(logs['episode_durations'])
+                            avg_return = torch.mean(torch.tensor(
+                                logs['episode_returns'], device='cpu', dtype=torch.float))
 
-                print('\nRecording test trajectories...\n')
-                # collect test set
-                for i_episode in tqdm(range(1, test_episodes+1)):
-                    test_trajectories.append([])
+                            wandb.log({
+                                'avg_episode_duration': avg_duration,
+                                'avg_episode_return': avg_return,
+                                'video': frames_to_video(frames),
+                                'episode': i_episode,
+                                'agent_step': actor.cumulative_steps,
+                                'epsilon': actor.explorer.epsilon,
+                                **{k: v['time'] / v['count'] for k, v in timing.items()}
+                            }, )
+                            logs['episode_durations'] = []
+                            logs['episode_returns'] = []
+                            timing = dict()
 
-                    observation = env.reset()
-                    frames = [env.render(mode='rgb_array')]
-                    rewards = []
+                    save_trajectories(trajectories_path, trajectories, env.action_space.n)
+                else:
+                    print('\nUsing existing training trajectories...\n')
 
-                    for i_step in count():
-                        partial_observation = observation['image_partial']
+                if not os.path.exists(test_trajectories_path):
+                    print('\nRecording test trajectories...\n')
+                    # collect test set
+                    for i_episode in tqdm(range(1, test_episodes+1)):
+                        test_trajectories.append([])
 
-                        with Timing(timing, 'time_choose_act'):
-                            action = actor.act(observation['image'])
+                        observation = env.reset()
+                        frames = [env.render(mode='rgb_array')]
+                        rewards = []
 
-                        with Timing(timing, 'time_perform_act'):
-                            observation, reward, done, _ = env.step(action)
+                        for i_step in count():
+                            partial_observation = observation['image_partial']
 
-                        with Timing(timing, 'time_observe'):
-                            actor.observe(
-                                observation['image'], reward, done, reset=False)
+                            with Timing(timing, 'time_choose_act'):
+                                action = actor.act(observation['image'])
 
-                        frames.append(env.render(mode='rgb_array'))
-                        rewards.append(reward)
+                            with Timing(timing, 'time_perform_act'):
+                                observation, reward, done, _ = env.step(action)
 
-                        # record cropped, *partial* observation for reward-prediction model
-                        step = (partial_observation, action, reward, done)
-                        test_trajectories[-1].append(step)
+                            with Timing(timing, 'time_observe'):
+                                actor.observe(
+                                    observation['image'], reward, done, reset=False)
 
-                        if done:
-                            logs['episode_returns'].append(sum(rewards))
-                            logs['episode_durations'].append(len(rewards))
-                            break
+                            frames.append(env.render(mode='rgb_array'))
+                            rewards.append(reward)
 
-                    if i_episode > 1 and (i_episode % log_frequency) == 0:
+                            # record cropped, *partial* observation for reward-prediction model
+                            step = (partial_observation, action, reward, done)
+                            test_trajectories[-1].append(step)
 
-                        avg_duration = np.mean(logs['episode_durations'])
-                        avg_return = torch.mean(torch.tensor(
-                            logs['episode_returns'], device='cpu', dtype=torch.float))
+                            if done:
+                                logs['episode_returns'].append(sum(rewards))
+                                logs['episode_durations'].append(len(rewards))
+                                break
 
-                        wandb.log({
-                            'avg_episode_duration': avg_duration,
-                            'avg_episode_return': avg_return,
-                            'video': frames_to_video(frames),
-                            'episode': i_episode,
-                            'agent_step': actor.cumulative_steps,
-                            'epsilon': actor.explorer.epsilon,
-                            **{k: v['time'] / v['count'] for k, v in timing.items()}
-                        }, )
-                        logs['episode_durations'] = []
-                        logs['episode_returns'] = []
-                        timing = dict()
+                        if i_episode > 1 and (i_episode % log_frequency) == 0:
 
-                trajectories_path = save_trajectories('train', trajectories, full_agent_dir, env.action_space.n)
-                test_trajectories_path = save_trajectories('test', test_trajectories, full_agent_dir, env.action_space.n)
+                            avg_duration = np.mean(logs['episode_durations'])
+                            avg_return = torch.mean(torch.tensor(
+                                logs['episode_returns'], device='cpu', dtype=torch.float))
+
+                            wandb.log({
+                                'avg_episode_duration': avg_duration,
+                                'avg_episode_return': avg_return,
+                                'video': frames_to_video(frames),
+                                'episode': i_episode,
+                                'agent_step': actor.cumulative_steps,
+                                'epsilon': actor.explorer.epsilon,
+                                **{k: v['time'] / v['count'] for k, v in timing.items()}
+                            }, )
+                            logs['episode_durations'] = []
+                            logs['episode_returns'] = []
+                            timing = dict()
+
+                    save_trajectories(test_trajectories_path, test_trajectories, env.action_space.n)
+                else:
+                    print('\nUsing existing test trajectories...\n')
 
                 print('\nStarting training of reward predictors...\n')
-                subprocess.run(['python', 'train_reward_predictors.py', '--group', group,
+                subprocess.run(['python', 'train_reward_predictors.py', '--group', agent_group,
                                                                         '--agent', agent_dir,
-                                                                        '--epochs', '15',
+                                                                        '--epochs', str(epochs),
                                                                         '--data-path', trajectories_path,
                                                                         '--test-path', test_trajectories_path,
-                                                                        '--seeds', '5'])
+                                                                        '--seeds', str(seeds)])
 
         trajectories = []
         test_trajectories = []
@@ -219,4 +235,3 @@ def record(note, group, env_name, seed, log_frequency, episodes, test_episodes, 
 
 if __name__ == '__main__':
     record()
-    print('Hello world')

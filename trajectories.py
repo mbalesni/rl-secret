@@ -4,7 +4,8 @@ import math
 import torch
 from torch.utils.data import Dataset, DataLoader, random_split
 from torch.nn.functional import one_hot
-from torch.nn.utils.rnn import pad_sequence
+
+from config import PAD_VAL
 
 
 class TrajectoriesDataset(Dataset):
@@ -18,6 +19,44 @@ class TrajectoriesDataset(Dataset):
 
     def __getitem__(self, idx):
         return (self.observations[idx, :], self.actions[idx, :], self.rewards[idx, :], idx)
+
+
+class TrajectoriesRecorder:
+    def __init__(self, n_episodes, seq_len, obs_dims, act_size, save_path, pad_val=PAD_VAL):
+
+        assert save_path is not None
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+        self.observations = torch.zeros((n_episodes, seq_len, *obs_dims), dtype=torch.float32)
+        self.actions = torch.ones((n_episodes, seq_len, act_size), dtype=torch.float32) * pad_val
+        self.rewards = torch.ones((n_episodes, seq_len), dtype=torch.long) * pad_val
+
+        self.act_size = act_size
+        self.save_path = save_path
+
+        self.current_episode = 0
+        self.current_step = 0
+
+    def add_step(self, step):
+        observation, action, reward, done = step
+
+        self.observations[self.current_episode][self.current_step] = torch.tensor(observation, dtype=torch.float32)
+
+        # one-hot encode actions
+        self.actions[self.current_episode][self.current_step] = one_hot_encode_action(action, self.act_size).type(torch.float32)
+
+        # convert reward values (-1,0,1) into "classes" (0,1,2)
+        self.rewards[self.current_episode][self.current_step] = reward + 1
+
+        self.current_step += 1
+
+        if done:
+            self.current_episode += 1
+            self.current_step = 0
+
+    def save(self):
+        dataset = TrajectoriesDataset(self.observations, self.actions, self.rewards)
+        torch.save(dataset, self.save_path)
 
 
 def preprocess_dataset(dataset, data_path, batch_size=128, valid_size=0.2, seed=42,
@@ -59,12 +98,16 @@ def preprocess_dataset(dataset, data_path, batch_size=128, valid_size=0.2, seed=
 
     # convert rewards to returns
     if sum_rewards:
+        padding_mask = (dataset.actions[:, :, 0] == PAD_VAL)  # PAD_VAL are True
+        dataset.rewards -= 1  # turn reward classes [0,1,2] into rewards [-1,0,1]
+        dataset.rewards[padding_mask] *= 0
+
         returns = torch.zeros_like(dataset.rewards)
         returns += torch.sum(dataset.rewards, axis=1)[:, None]
-        dataset.rewards = returns
+        returns += 1  # turn returns [-1,0,1] into return classes [0,1,2]
+        returns[padding_mask] = PAD_VAL
 
-    # convert reward values (-1,0,1) into "classes" (0,1,2)
-    dataset.rewards += 1
+        dataset.rewards = returns
 
     # prepare batches
     if not eval_mode:
@@ -77,64 +120,9 @@ def preprocess_dataset(dataset, data_path, batch_size=128, valid_size=0.2, seed=
         return data_loader
 
 
-def episodes_to_tensors(episodes, action_size, verbose=False, pad_val=10.):
-
-    observations_by_episode = []
-    actions_by_episode = []
-    rewards_by_episode = []
-
-    for episode in episodes:
-
-        observations = []
-        actions = []
-        rewards = []
-
-        for step in episode:
-            observation, action, reward, done = step
-
-            observations.append(observation)
-            actions.append(one_hot_encode_action(action, action_size))
-            rewards.append(reward)
-
-        observations = torch.tensor(observations, dtype=torch.float32)
-        actions = torch.stack(actions).type(torch.float32)
-        rewards = torch.tensor(rewards, dtype=torch.long)
-
-        observations_by_episode.append(observations)
-        actions_by_episode.append(actions)
-        rewards_by_episode.append(rewards)
-
-    observations_by_episode = pad_sequence(
-        observations_by_episode, batch_first=True, padding_value=0)
-    actions_by_episode = pad_sequence(
-        actions_by_episode, batch_first=True, padding_value=pad_val)
-    rewards_by_episode = pad_sequence(
-        rewards_by_episode, batch_first=True, padding_value=0)  # pad reward with 0 because we only case about return anyways
-
-    return observations_by_episode, actions_by_episode, rewards_by_episode
-
-
 def one_hot_encode_action(action, n_classes=3):
     index = torch.tensor(int(action))
     return one_hot(index, n_classes)
-
-
-def save_trajectories(recording_name, trajectories, base_dir, action_size, pad_val=10):
-    print('Saving experience...')
-    # convert list of episodes into PyTorch dataset
-    observations, actions, rewards = episodes_to_tensors(
-        trajectories, action_size, verbose=False, pad_val=pad_val)
-    dataset = TrajectoriesDataset(observations, actions, rewards)
-
-    # create a new folder for dataset
-    directory = os.path.join(base_dir, 'trajectories')
-    os.makedirs(directory, exist_ok=True)
-    recording_name = f'{recording_name}.pt'
-    full_path = os.path.join(directory, recording_name)
-
-    torch.save(dataset, full_path)
-
-    return full_path
 
 
 def find_activations(observations, actions, forward_action=2, target='prize'):

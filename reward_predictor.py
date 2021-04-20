@@ -4,6 +4,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from config import PAD_VAL
+
 
 class TransformerEncoderCustom(nn.TransformerEncoderLayer):
     '''Modified to return *attention weights* in addition to output'''
@@ -63,7 +65,7 @@ class RewardPredictor(nn.Module):
         device,
         dim_feedforward=128,
         n_filters=32,
-        pad_val=10,
+        pad_val=PAD_VAL,
         max_len=250,
         verbose=False,
     ):
