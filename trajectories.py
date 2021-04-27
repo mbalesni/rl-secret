@@ -21,6 +21,20 @@ class TrajectoriesDataset(Dataset):
         return (self.observations[idx, :], self.actions[idx, :], self.rewards[idx, :], idx)
 
 
+class StateFullTrajectoriesDataset(Dataset):
+    def __init__(self, observations, full_observations, actions, rewards):
+        self.observations = observations
+        self.full_observations = full_observations
+        self.actions = actions
+        self.rewards = rewards
+
+    def __len__(self):
+        return len(self.observations)
+
+    def __getitem__(self, idx):
+        return (self.observations[idx, :], self.full_observations[idx, :], self.actions[idx, :], self.rewards[idx, :], idx)
+
+
 class TrajectoriesRecorder:
     def __init__(self, n_episodes, seq_len, obs_dims, act_size, save_path, pad_val=PAD_VAL):
 
@@ -29,7 +43,7 @@ class TrajectoriesRecorder:
 
         self.observations = torch.zeros((n_episodes, seq_len, *obs_dims), dtype=torch.float32)
         self.actions = torch.ones((n_episodes, seq_len, act_size), dtype=torch.float32) * pad_val
-        self.rewards = torch.ones((n_episodes, seq_len), dtype=torch.long) * pad_val
+        self.rewards = torch.ones((n_episodes, seq_len), dtype=torch.long) * int(pad_val)
 
         self.act_size = act_size
         self.save_path = save_path
@@ -37,8 +51,7 @@ class TrajectoriesRecorder:
         self.current_episode = 0
         self.current_step = 0
 
-    def add_step(self, step):
-        observation, action, reward, done = step
+    def add_step(self, observation, action, reward, done):
 
         self.observations[self.current_episode][self.current_step] = torch.tensor(observation, dtype=torch.float32)
 
@@ -56,6 +69,46 @@ class TrajectoriesRecorder:
 
     def save(self):
         dataset = TrajectoriesDataset(self.observations, self.actions, self.rewards)
+        torch.save(dataset, self.save_path)
+
+
+class StatefullTrajectoriesRecorder:
+    def __init__(self, n_episodes, seq_len, obs_dims, full_obs_dims, act_size, save_path, pad_val=PAD_VAL):
+
+        assert save_path is not None
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+        self.observations = torch.zeros((n_episodes, seq_len, *obs_dims), dtype=torch.float32)
+        self.full_observations = torch.zeros((n_episodes, seq_len, *full_obs_dims), dtype=torch.float32)
+        self.actions = torch.ones((n_episodes, seq_len, act_size), dtype=torch.float32) * pad_val
+        self.rewards = torch.ones((n_episodes, seq_len), dtype=torch.long) * int(pad_val)
+
+        self.act_size = act_size
+        self.save_path = save_path
+
+        self.current_episode = 0
+        self.current_step = 0
+
+    def add_step(self, observation, full_observation, action, reward, done):
+
+        # add 1) partial (cropped) pixel observation and 2) full pixel observation
+        self.observations[self.current_episode][self.current_step] = torch.tensor(observation, dtype=torch.float32)
+        self.full_observations[self.current_episode][self.current_step] = torch.tensor(full_observation, dtype=torch.float32)
+
+        # one-hot encode actions
+        self.actions[self.current_episode][self.current_step] = one_hot_encode_action(action, self.act_size).type(torch.float32)
+
+        # convert reward values (-1,0,1) into "classes" (0,1,2)
+        self.rewards[self.current_episode][self.current_step] = reward + 1
+
+        self.current_step += 1
+
+        if done:
+            self.current_episode += 1
+            self.current_step = 0
+
+    def save(self):
+        dataset = StateFullTrajectoriesDataset(self.observations, self.full_observations, self.actions, self.rewards)
         torch.save(dataset, self.save_path)
 
 
