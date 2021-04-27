@@ -129,10 +129,20 @@ def forward_batch(model, criterion, batch, device, timing, ca_gt, skip_no_trigge
         masked_returns = returns[padding_mask]
 
         # balanced accuracy
-        acc_neg = torch.sum(torch.logical_and(masked_preds == 0, masked_returns == 0)) / torch.sum(masked_returns == 0)
-        acc_zero = torch.sum(torch.logical_and(masked_preds == 1, masked_returns == 1)) / torch.sum(masked_returns == 1)
-        acc_pos = torch.sum(torch.logical_and(masked_preds == 2, masked_returns == 2)) / torch.sum(masked_returns == 2)
-        acc = torch.mean(torch.tensor([acc_neg, acc_zero, acc_pos]))
+        n_neg_rewards = torch.sum(masked_returns == 0)
+        n_zero_rewards = torch.sum(masked_returns == 1)
+        n_pos_rewards = torch.sum(masked_returns == 2)
+        accs = []
+        acc_neg = (torch.sum(torch.logical_and(masked_preds == 0, masked_returns == 0)) / n_neg_rewards)
+        if not torch.isnan(acc_neg):
+            accs.append(acc_neg)
+        acc_zero = (torch.sum(torch.logical_and(masked_preds == 1, masked_returns == 1)) / n_zero_rewards)
+        if not torch.isnan(acc_zero):
+            accs.append(acc_zero)
+        acc_pos = (torch.sum(torch.logical_and(masked_preds == 2, masked_returns == 2)) / n_pos_rewards)
+        if not torch.isnan(acc_pos):
+            accs.append(acc_pos)
+        acc = torch.mean(torch.tensor(accs))
 
         # Compute credit assignment average graph #
 
@@ -156,8 +166,9 @@ def forward_batch(model, criterion, batch, device, timing, ca_gt, skip_no_trigge
 
         # scatter the batch's attention values over a relative timestep matrix (N, S*2+1)
         n_episodes_prizes_and_triggers = torch.sum(torch.logical_and(prize_episodes_mask_batch, trigger_episodes_mask_batch))
+        rel_attention_vals = torch.zeros((N, seq_len*2+1), device=device)
         if n_episodes_prizes_and_triggers > 0:
-            rel_attention_vals = torch.zeros((N, seq_len*2+1), device=device).scatter(1, rel_timesteps, attention_vals)
+            rel_attention_vals.scatter_(1, rel_timesteps, attention_vals)
             rel_attention_vals *= trigger_episodes_mask_batch[:, None]
             rel_attention_vals = torch.sum(rel_attention_vals, axis=0) / n_episodes_prizes_and_triggers  # (S*2+1)
 
@@ -245,7 +256,7 @@ def evaluate(model, criterion, data_loader, device, timing, ca_gt, ca_skip_episo
 @click.option('--batch-size', default=128, help='training batch size')
 @click.option('--use-returns/--use-rewards', default=False, help='whether to predict returns instead of single-step rewards')
 @click.option('--attention-threshold', default=0.2, help='threshold attention weight discretization')
-@click.option('--skip-no-trigger-episodes-precision/--include-no-trigger-episodes-precision', required=True,
+@click.option('--skip-no-trigger-episodes-precision/--include-no-trigger-episodes-precision', default=None, required=True,
               help='whether to skip no-trigger episodes when calculating credit assignment precision')
 @click.option('--valid-size', type=float, default=0.2, help='proportion of validation set')
 @click.option('--use-wandb/--no-wandb', default=True)
@@ -375,26 +386,6 @@ def train(agent, group, note, data_path, test_path, seed, seeds, log_frequency,
                         _, _ = evaluate(model, criterion, valid_loader,
                                         device, timing, ca_gt, skip_no_trigger_episodes_precision)
 
-                with Timing(timing, 'time_draw_ca_plots'):
-
-                    # create credit assignment plots
-                    fig, axes = plt.subplots(1, 2, figsize=(12.5, 6))
-
-                    x_axis = (torch.arange(attention_batch.shape[0]) - seq_len).cpu()
-
-                    axes[0].set_title('Training (single batch)')
-                    axes[0].set_xlabel('Relative step in trajectory (0 - activating trigger)')
-                    axes[0].set_ylabel('Average attention weights')
-                    axes[0].plot(x_axis, attention_batch.cpu())
-
-                    axes[1].set_title('Validation (average across batches)')
-                    axes[1].set_xlabel('Relative step in trajectory (0 - activating trigger)')
-                    axes[1].set_ylabel('Average attention weights')
-                    axes[1].plot(x_axis, val_rel_attention_vals_avg.cpu())
-
-                    wandb_plot_image = wandb.Image(plt)
-                    plt.close('all')
-
                 with Timing(timing, 'time_save_model'):
                     if val_ca_precision >= best_val_precision and \
                             val_ca_recall >= best_val_recall and \
@@ -407,7 +398,6 @@ def train(agent, group, note, data_path, test_path, seed, seeds, log_frequency,
                         torch.save(model, BEST_MODEL_PATH)
 
                 log_dict = {
-                    'average_attention': wandb_plot_image,
                     'acc': acc_batch,
                     'epoch': epoch,
                     'loss': loss_batch,
@@ -421,6 +411,25 @@ def train(agent, group, note, data_path, test_path, seed, seeds, log_frequency,
                     log_dict['ca_precision'] = ca_precision_batch
                 if ca_recall_batch is not None:
                     log_dict['ca_recall'] = ca_recall_batch
+                if torch.count_nonzero(attention_batch) > 0:
+                    with Timing(timing, 'time_draw_ca_plots'):
+                        # create credit assignment plots
+                        fig, axes = plt.subplots(1, 2, figsize=(12.5, 6))
+
+                        x_axis = (torch.arange(attention_batch.shape[0]) - seq_len).cpu()
+
+                        axes[0].set_title('Training (single batch)')
+                        axes[0].set_xlabel('Relative step in trajectory (0 - activating trigger)')
+                        axes[0].set_ylabel('Average attention weights')
+                        axes[0].plot(x_axis, attention_batch.cpu())
+
+                        axes[1].set_title('Validation (average across batches)')
+                        axes[1].set_xlabel('Relative step in trajectory (0 - activating trigger)')
+                        axes[1].set_ylabel('Average attention weights')
+                        axes[1].plot(x_axis, val_rel_attention_vals_avg.cpu())
+
+                        log_dict['average_attention'] = wandb.Image(plt)
+                        plt.close('all')
 
                 wandb.log(log_dict)
 
@@ -436,7 +445,7 @@ def train(agent, group, note, data_path, test_path, seed, seeds, log_frequency,
         print(f'Evaluating reward predictor seed={i_seed}...\n')
         # Evaluate best model on the test set and log results
         run_ca_evaluation(BEST_MODEL_PATH, test_path, obs_mean_path, obs_std_path, wandb, attention_threshold,
-                          batch_size, skip_no_trigger_episodes_precision, use_returns=use_returns)
+                          batch_size, skip_no_trigger_episodes_precision, use_returns=use_returns, use_wandb=use_wandb)
 
         wandb.finish()
 
