@@ -2,29 +2,17 @@ import numpy as np
 import gym
 import torch
 import click
-import pickle
 import os
-import time
 import random
 from xvfbwrapper import Xvfb
 
 import wandb
 from itertools import count
 from timing import Timing
+from tqdm import tqdm
 
-from gym_minigrid.wrappers import ImgObsWrapper, RGBImgPartialObsWrapper, RGBImgObsWrapper
+from gym_minigrid.wrappers import ImgObsWrapper, RGBImgObsWrapper
 from dqn_pfrl import DQN_PFRL_ACTOR
-
-
-recording = {
-    'episodes': []
-}
-logs = {
-    'episode_durations': [],
-    'episode_returns': []
-}
-
-'''According to: https://docs.wandb.ai/library/log#images-and-overlays'''
 
 
 def frames_to_video(frames, fps=15):
@@ -32,42 +20,139 @@ def frames_to_video(frames, fps=15):
     return wandb.Video(stacked_frames, fps=fps, format="gif")
 
 
-def save_experience(base_dir):
-    print('Saving experience...')
-    directory = os.path.join(base_dir, 'recordings')
-    os.makedirs(directory, exist_ok=True)
-    recording_name = f'agent_experience_{round(time.time())}.pt'
-    full_path = os.path.join(directory, recording_name)
-    with open(full_path, 'wb') as f:
-        pickle.dump(recording, f)
+def compute_obs_normalization(episodes, env, obs_shape, save_dir):
+
+    observations = torch.zeros((episodes, 50, *obs_shape))
+    with Xvfb():
+        for i_episode in tqdm(range(episodes), mininterval=0.5, desc='Computing obs norm'):
+
+            observation = env.reset()
+
+            for i_step in count():
+                action = np.random.choice(env.action_space.n, p=[0.2, 0.2, 0.6])  # [left, right, forward] go forward more often
+                observation, reward, done, _ = env.step(action)
+                observations[i_episode, i_step] = torch.tensor(observation)
+
+                if done:
+                    break
+
+    # calculate normalization values on train subset
+    mean = torch.mean(observations, axis=(0, 1, 2, 3))
+    std = torch.std(observations, axis=(0, 1, 2, 3))
+
+    # save normalization values for potential future use
+    os.makedirs(save_dir, exist_ok=True)
+    torch.save(mean, os.path.join(save_dir, 'obs_mean.pt'))
+    torch.save(std, os.path.join(save_dir, 'obs_std.pt'))
+
+    print('mean', mean)
+    print('std', std)
+
+    return mean, std
+
+
+def run_training(episodes, actor, env, obs_shape, save_path, log_frequency, log_prefix='', gifs=False, normalize=False):
+    '''Run training of a DQN PFRL agent with SECRET attention model and custom reward redistribution.'''
+
+    frames = []
+    logs = {
+        'episode_durations': [],
+        'episode_returns': []
+    }
+    timing = dict()
+
+    best_return = -999999
+    best_agent_dir = os.path.join(save_path, 'best_agent')
+    final_agent_dir = os.path.join(save_path, 'final_agent')
+    os.makedirs(best_agent_dir, exist_ok=True)
+    os.makedirs(final_agent_dir, exist_ok=True)
+
+    obs_mean, obs_std = compute_obs_normalization(100, env, obs_shape, save_path)
+    obs_mean_np = obs_mean.numpy()
+    obs_std_np = obs_std.numpy()
+
+    with Xvfb():
+        for i_episode in tqdm(range(1, episodes+1), mininterval=0.5):
+
+            observation = env.reset()
+            if gifs:
+                frames = [env.render(mode='rgb_array')]
+            rewards = []
+
+            for i_step in count():
+
+                with Timing(timing, 'time_choose_act'):
+                    action = actor.act(observation)
+
+                with Timing(timing, 'time_perform_act'):
+                    observation, reward, done, _ = env.step(action)
+
+                if normalize:
+                    with Timing(timing, 'time_normalize_obs'):
+                        observation = observation.astype(np.float32)
+                        observation -= obs_mean_np
+                        observation /= obs_std_np
+
+                with Timing(timing, 'time_observe'):
+                    actor.observe(observation, reward, done, reset=False)
+
+                if gifs:
+                    frames.append(env.render(mode='rgb_array'))
+                rewards.append(reward)
+
+                if done:
+                    logs['episode_returns'].append(sum(rewards))
+                    logs['episode_durations'].append(len(rewards))
+                    break
+
+            if i_episode > 1 and (i_episode % log_frequency) == 0:
+
+                avg_duration = np.mean(logs['episode_durations'])
+                avg_return = torch.mean(torch.tensor(logs['episode_returns'], device='cpu', dtype=torch.float))
+
+                wandb.log({
+                    f'{log_prefix}avg_episode_duration': avg_duration,
+                    f'{log_prefix}avg_episode_return': avg_return,
+                    f'{log_prefix}video': frames_to_video(frames) if gifs else None,
+                    f'{log_prefix}episode': i_episode,
+                    **{f'{log_prefix}{k}': v['time'] / v['count'] for k, v in timing.items()}
+                })
+                logs['episode_durations'] = []
+                logs['episode_returns'] = []
+                timing = dict()
+
+                if avg_return > best_return:
+                    best_return = avg_return
+                    actor.save(best_agent_dir)
 
 
 @click.command()
-@click.option('--note', type=str, help='message to explain how is this run different')
-@click.option('--group', type=str)
+@click.option('--batch-size', default=32, help='training batch size')
+@click.option('--buffer-size', default=5e4, type=int, help='size of the replay buffer')
+@click.option('--buffer-prefill-steps', default=5e3, type=int, help='size of the prefilled replay buffer')
 @click.option('--env-name', type=str, default='MiniGrid-Triggers-3x3-v0')
-@click.option('--seed', type=int, default=42, help='random seed used')
-@click.option('--log-frequency', type=int, default=5e1, help='logging frequency, episodes')
-@click.option('--model-save-frequency', type=int, default=5e3, help='model saving frequency, episodes')
 @click.option('--episodes', type=int, help='number of episodes to train for', required=True)
-@click.option('--learning-rate', type=float, default=1e-1, help='goal learning rate')
-@click.option('--gamma', type=float, default=0.999, help='discount factor')
 @click.option('--eps-start', type=float, default=1, help='starting exploration epsilon')
 @click.option('--eps-end', type=float, default=0.1, help='final exploration epsilon')
 @click.option('--eps-decay', type=int, default=250_000, help='final exploration epsilon')
-@click.option('--buffer-size', default=5e4, type=int, help='size of the replay buffer')
-@click.option('--buffer-prefill-steps', default=5e3, type=int, help='size of the prefilled replay buffer')
-@click.option('--batch-size', default=32, help='training batch size')
-@click.option('--part-observ/--full-observ', default=True, help='view a part of the environment or see the full picture')
-@click.option('--record/--no-record', default=True)
-@click.option('--record-random', is_flag=True)
+@click.option('--gamma', type=float, default=0.999, help='discount factor')
+@click.option('--group', type=str)
+@click.option('--log-frequency', type=int, default=5e1, help='logging frequency, episodes')
+@click.option('--learning-rate', type=float, default=1e-1, help='goal learning rate')
+@click.option('--note', type=str, help='message to explain how is this run different')
+@click.option('--normalize-obs/--not-normalize-obs', default=None, required=True, help='whether to normalize agent observations')
+@click.option('--seed', type=int, default=42, help='random seed used')
 @click.option('--target-freq', type=int, default=2000, help='how frequently to update target network')
 @click.option('--update-freq', type=int, default=1, help='how frequently to run optimization')
 @click.option('--use-wandb/--no-wandb', default=True)
-def train(note, group, env_name, seed, log_frequency, model_save_frequency, episodes,
-          learning_rate, gamma, eps_start, eps_end, eps_decay,
-          buffer_size, buffer_prefill_steps, batch_size,
-          part_observ, record, record_random, target_freq, update_freq, use_wandb):
+def train(batch_size, buffer_size, buffer_prefill_steps,
+          env_name, episodes, eps_start, eps_end, eps_decay,
+          gamma, group,
+          log_frequency, learning_rate,
+          note, normalize_obs,
+          seed,
+          target_freq,
+          update_freq, use_wandb):
 
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
@@ -82,7 +167,6 @@ def train(note, group, env_name, seed, log_frequency, model_save_frequency, epis
                    env_name=env_name,
                    seed=seed,
                    log_frequency=log_frequency,
-                   model_save_frequency=model_save_frequency,
                    episodes=episodes,
                    learning_rate=learning_rate,
                    gamma=gamma,
@@ -92,9 +176,6 @@ def train(note, group, env_name, seed, log_frequency, model_save_frequency, epis
                    buffer_size=buffer_size,
                    buffer_prefill_steps=buffer_prefill_steps,
                    batch_size=batch_size,
-                   part_observ=part_observ,
-                   record=record,
-                   record_random=record_random,
                    target_freq=target_freq,
                    update_freq=update_freq,
                ))
@@ -104,7 +185,6 @@ def train(note, group, env_name, seed, log_frequency, model_save_frequency, epis
 
     os.makedirs(agent_save_dir, exist_ok=True)
     wandb.save(os.path.join(save_dir, "*.pt"))
-    wandb.save(os.path.join(save_dir, "recordings", "*.pt"))
     wandb.save(os.path.join(agent_save_dir, "*.pt"))
 
     torch.cuda.manual_seed(seed)
@@ -114,10 +194,7 @@ def train(note, group, env_name, seed, log_frequency, model_save_frequency, epis
 
     env = gym.make(env_name)
     if 'MiniGrid' in env_name:  # support non-MiniGrid environments
-        if part_observ:
-            env = ImgObsWrapper(RGBImgPartialObsWrapper(env))
-        else:
-            env = ImgObsWrapper(RGBImgObsWrapper(env))
+        env = ImgObsWrapper(RGBImgObsWrapper(env))
 
     observation_shape = env.reset().shape
     actor = DQN_PFRL_ACTOR(*observation_shape, env.action_space.n,
@@ -126,56 +203,7 @@ def train(note, group, env_name, seed, log_frequency, model_save_frequency, epis
                            eps_end=eps_end, eps_decay=eps_decay, update_interval=update_freq,
                            target_update=target_freq, env=env, update_start=buffer_prefill_steps).agent
 
-    with Xvfb():
-
-        timing = dict()
-        print('Training...')
-        for i_episode in range(1, episodes+1):
-            observation = env.reset()
-            frames = [env.render(mode='rgb_array')]
-            rewards = []
-
-            for i_step in count():
-                with Timing(timing, 'time_choose_act'):
-                    action = actor.act(observation)
-
-                with Timing(timing, 'time_perform_act'):
-                    observation, reward, done, _ = env.step(action)
-
-                with Timing(timing, 'time_observe'):
-                    actor.observe(observation, reward, done, reset=False)
-
-                frames.append(env.render(mode='rgb_array'))
-                rewards.append(reward)
-
-                if done:
-                    logs['episode_returns'].append(sum(rewards))
-                    logs['episode_durations'].append(len(rewards))
-                    break
-
-            if i_episode > 1 and (i_episode % log_frequency) == 0:
-
-                avg_duration = np.mean(logs['episode_durations'])
-                avg_return = torch.mean(torch.tensor(
-                    logs['episode_returns'], device='cpu', dtype=torch.float))
-
-                wandb.log({
-                    'avg_episode_duration': avg_duration,
-                    'avg_episode_return': avg_return,
-                    'video': frames_to_video(frames),
-                    'episode': i_episode,
-                    'agent_step': actor.cumulative_steps,
-                    'epsilon': actor.explorer.epsilon,
-                    **{k: v['time'] / v['count'] for k, v in timing.items()}
-                }, )
-                logs['episode_durations'] = []
-                logs['episode_returns'] = []
-                timing = dict()
-
-                if i_episode % model_save_frequency == 0:
-                    agent_version_folder = f'ep{i_episode}'
-                    os.makedirs(os.path.join(agent_save_dir, agent_version_folder), exist_ok=True)
-                    actor.save(os.path.join(agent_save_dir, agent_version_folder))
+    run_training(episodes, actor, env, observation_shape, agent_save_dir, log_frequency, normalize=normalize_obs)
 
     env.close()
     wandb.finish()
