@@ -20,6 +20,9 @@ class TrajectoriesDataset(Dataset):
     def __getitem__(self, idx):
         return (self.observations[idx, :], self.actions[idx, :], self.rewards[idx, :], idx)
 
+    def compute_pad_mask(self):
+        return self.actions[:, :, 0] != PAD_VAL
+
 
 class StateFullTrajectoriesDataset(Dataset):
     def __init__(self, observations, full_observations, actions, rewards):
@@ -33,6 +36,9 @@ class StateFullTrajectoriesDataset(Dataset):
 
     def __getitem__(self, idx):
         return (self.observations[idx, :], self.full_observations[idx, :], self.actions[idx, :], self.rewards[idx, :], idx)
+
+    def compute_pad_mask(self):
+        return self.actions[:, :, 0] != PAD_VAL
 
 
 class TrajectoriesRecorder:
