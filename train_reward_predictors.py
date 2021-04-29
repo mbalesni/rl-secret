@@ -6,6 +6,7 @@ import click
 import os
 import random
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+import gc
 
 import wandb
 from timing import Timing
@@ -65,8 +66,10 @@ def run_ca_evaluation(model_path, data_path,
 
     # 3. Evaluate each model on the data
     model = torch.load(model_path).to(device)
-    _, acc, ca_precision, ca_recall, rel_attention_vals, preds, trues = evaluate(model, criterion, data_loader, device,
-                                                                                 timing, ca_gt, ca_ignore_episodes_without_triggers)
+    model.eval()
+    with torch.no_grad():
+        _, acc, ca_precision, ca_recall, rel_attention_vals, preds, trues = evaluate(model, criterion, data_loader, device,
+                                                                                     timing, ca_gt, ca_ignore_episodes_without_triggers)
 
     # confusion matrix
     c_matrix = confusion_matrix(trues, preds, normalize=None)
@@ -132,15 +135,16 @@ def forward_batch(model, criterion, batch, device, timing, ca_gt, skip_no_trigge
         n_neg_rewards = torch.sum(masked_returns == 0)
         n_zero_rewards = torch.sum(masked_returns == 1)
         n_pos_rewards = torch.sum(masked_returns == 2)
+
         accs = []
-        acc_neg = (torch.sum(torch.logical_and(masked_preds == 0, masked_returns == 0)) / n_neg_rewards)
-        if not torch.isnan(acc_neg):
+        if n_neg_rewards > 0:
+            acc_neg = (torch.sum(torch.logical_and(masked_preds == 0, masked_returns == 0)) / n_neg_rewards)
             accs.append(acc_neg)
-        acc_zero = (torch.sum(torch.logical_and(masked_preds == 1, masked_returns == 1)) / n_zero_rewards)
-        if not torch.isnan(acc_zero):
+        if n_zero_rewards > 0:
+            acc_zero = (torch.sum(torch.logical_and(masked_preds == 1, masked_returns == 1)) / n_zero_rewards)
             accs.append(acc_zero)
-        acc_pos = (torch.sum(torch.logical_and(masked_preds == 2, masked_returns == 2)) / n_pos_rewards)
-        if not torch.isnan(acc_pos):
+        if n_pos_rewards > 0:
+            acc_pos = (torch.sum(torch.logical_and(masked_preds == 2, masked_returns == 2)) / n_pos_rewards)
             accs.append(acc_pos)
         acc = torch.mean(torch.tensor(accs))
 
@@ -269,43 +273,43 @@ def train(agent, group, note, data_path, test_path, seed, seeds, log_frequency,
 
     wandb.login()
 
-    # data
-    dataset = torch.load(data_path)
-
-    trigger_activations = find_activations(dataset.observations, dataset.actions, target='trigger').to(device)  # (N, S)
-    prize_activations = find_activations(dataset.observations, dataset.actions, target='prize')  # (N, S)
-
-    trigger_timesteps = torch.argmax(trigger_activations, axis=-1).to(device)  # (N,)
-    prize_timesteps = torch.argmax(prize_activations, axis=-1)  # (N,)
-
-    # episode binary masks where prizes/triggers were taken
-    episodes_with_trigger_mask = torch.sum(trigger_activations, axis=-1).to(device)  # (N, )
-    episodes_with_prize_mask = torch.sum(prize_activations, axis=-1).to(device)  # (N, )
-
-    seq_len = dataset.observations.shape[1]
-
-    # credit assignment ground truths
-    ca_gt = {
-        'attention_threshold': attention_threshold,
-        'episodes_with_trigger_mask': episodes_with_trigger_mask,
-        'episodes_with_prize_mask': episodes_with_prize_mask,
-        'trigger_activations': trigger_activations,
-        'trigger_timesteps': trigger_timesteps,
-        'prize_activations': prize_activations,
-        'prize_timesteps': prize_timesteps,
-        'seq_len': seq_len,
-    }
-
-    train_loader, valid_loader, obs_mean_path, obs_std_path = preprocess_dataset(dataset, data_path,
-                                                                                 sum_rewards=use_returns,
-                                                                                 batch_size=batch_size,
-                                                                                 valid_size=valid_size,
-                                                                                 seed=seed)
-
-    # model
-    class_weights = torch.tensor([0.499, 0.02, 0.499]).to(device)
-
     for i_seed in range(seed, seed+seeds):
+
+        # data
+        dataset = torch.load(data_path)
+
+        trigger_activations = find_activations(dataset.observations, dataset.actions, target='trigger').to(device)  # (N, S)
+        prize_activations = find_activations(dataset.observations, dataset.actions, target='prize')  # (N, S)
+
+        trigger_timesteps = torch.argmax(trigger_activations, axis=-1).to(device)  # (N,)
+        prize_timesteps = torch.argmax(prize_activations, axis=-1)  # (N,)
+
+        # episode binary masks where prizes/triggers were taken
+        episodes_with_trigger_mask = torch.sum(trigger_activations, axis=-1).to(device)  # (N, )
+        episodes_with_prize_mask = torch.sum(prize_activations, axis=-1).to(device)  # (N, )
+
+        seq_len = dataset.observations.shape[1]
+
+        # credit assignment ground truths
+        ca_gt = {
+            'attention_threshold': attention_threshold,
+            'episodes_with_trigger_mask': episodes_with_trigger_mask,
+            'episodes_with_prize_mask': episodes_with_prize_mask,
+            'trigger_activations': trigger_activations,
+            'trigger_timesteps': trigger_timesteps,
+            'prize_activations': prize_activations,
+            'prize_timesteps': prize_timesteps,
+            'seq_len': seq_len,
+        }
+
+        train_loader, valid_loader, obs_mean_path, obs_std_path = preprocess_dataset(dataset, data_path,
+                                                                                     sum_rewards=use_returns,
+                                                                                     batch_size=batch_size,
+                                                                                     valid_size=valid_size,
+                                                                                     seed=seed)
+
+        # model
+        class_weights = torch.tensor([0.499, 0.02, 0.499]).to(device)
 
         wandb.init(project='attentional_fw_baselines',
                    entity='ut-rl-credit',
@@ -366,11 +370,11 @@ def train(agent, group, note, data_path, test_path, seed, seeds, log_frequency,
                 timing = dict()
 
                 model.train()
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 loss_batch, acc_batch, ca_precision_batch, ca_recall_batch, \
                     attention_batch, _, _ = forward_batch(model, criterion, batch, device,
                                                           timing, ca_gt, skip_no_trigger_episodes_precision)
-                losses.append(loss_batch.item())
+                losses.append(loss_batch)
 
                 # Reshape output for K-dimensional CrossEntropy loss
                 with Timing(timing, 'time_optimize_model'):
@@ -433,14 +437,27 @@ def train(agent, group, note, data_path, test_path, seed, seeds, log_frequency,
 
                 wandb.log(log_dict)
 
-            # free some GPU memory
-            torch.cuda.empty_cache()
+                # free some GPU memory
+                torch.cuda.empty_cache()
 
-            mean_loss = sum(losses) / len(losses)
+            mean_loss = torch.mean(torch.tensor(losses))
             scheduler.step(mean_loss)
 
         torch.save(model, FINAL_MODEL_PATH)
+        del trigger_activations
+        del prize_activations
+        del trigger_timesteps
+        del prize_timesteps
+        del episodes_with_trigger_mask
+        del episodes_with_prize_mask
+        del ca_gt
         del model
+        del dataset
+        del train_loader
+        del valid_loader
+        del class_weights
+        gc.collect()
+        torch.cuda.empty_cache()
 
         print(f'Evaluating reward predictor seed={i_seed}...\n')
         # Evaluate best model on the test set and log results
