@@ -20,38 +20,7 @@ def frames_to_video(frames, fps=15):
     return wandb.Video(stacked_frames, fps=fps, format="gif")
 
 
-def compute_obs_normalization(episodes, env, obs_shape, save_dir):
-
-    observations = torch.zeros((episodes, 50, *obs_shape))
-    with Xvfb():
-        for i_episode in tqdm(range(episodes), mininterval=0.5, desc='Computing obs norm'):
-
-            observation = env.reset()
-
-            for i_step in count():
-                action = np.random.choice(env.action_space.n, p=[0.2, 0.2, 0.6])  # [left, right, forward] go forward more often
-                observation, reward, done, _ = env.step(action)
-                observations[i_episode, i_step] = torch.tensor(observation)
-
-                if done:
-                    break
-
-    # calculate normalization values on train subset
-    mean = torch.mean(observations, axis=(0, 1, 2, 3))
-    std = torch.std(observations, axis=(0, 1, 2, 3))
-
-    # save normalization values for potential future use
-    os.makedirs(save_dir, exist_ok=True)
-    torch.save(mean, os.path.join(save_dir, 'obs_mean.pt'))
-    torch.save(std, os.path.join(save_dir, 'obs_std.pt'))
-
-    print('mean', mean)
-    print('std', std)
-
-    return mean, std
-
-
-def run_training(episodes, agent, env, obs_shape, save_path, log_frequency, log_prefix='', gifs=False, normalize=False):
+def run_training(episodes, agent, env, obs_shape, save_path, log_frequency, log_prefix='', gifs=False):
     '''Run training of a DQN PFRL agent with SECRET attention model and custom reward redistribution.'''
 
     frames = []
@@ -66,11 +35,6 @@ def run_training(episodes, agent, env, obs_shape, save_path, log_frequency, log_
     final_agent_dir = os.path.join(save_path, 'final_agent')
     os.makedirs(best_agent_dir, exist_ok=True)
     os.makedirs(final_agent_dir, exist_ok=True)
-
-    if normalize:
-        obs_mean, obs_std = compute_obs_normalization(100, env, obs_shape, save_path)
-        obs_mean_np = obs_mean.numpy()
-        obs_std_np = obs_std.numpy()
 
     actor = agent.agent
 
@@ -89,12 +53,6 @@ def run_training(episodes, agent, env, obs_shape, save_path, log_frequency, log_
 
                 with Timing(timing, 'time_perform_act'):
                     observation, reward, done, _ = env.step(action)
-
-                if normalize:
-                    with Timing(timing, 'time_normalize_obs'):
-                        observation = observation.astype(np.float32)
-                        observation -= obs_mean_np
-                        observation /= obs_std_np
 
                 with Timing(timing, 'time_observe'):
                     actor.observe(observation, reward, done, reset=False)
@@ -131,19 +89,18 @@ def run_training(episodes, agent, env, obs_shape, save_path, log_frequency, log_
 
 @click.command()
 @click.option('--batch-size', default=32, help='training batch size')
-@click.option('--buffer-size', default=5e4, type=int, help='size of the replay buffer')
+@click.option('--buffer-size', default=1_000_000, type=int, help='size of the replay buffer')
 @click.option('--buffer-prefill-steps', default=5e3, type=int, help='size of the prefilled replay buffer')
 @click.option('--env-name', type=str, default='MiniGrid-Triggers-3x3-T1P1-v0')
 @click.option('--episodes', type=int, help='number of episodes to train for', required=True)
 @click.option('--eps-start', type=float, default=1, help='starting exploration epsilon')
 @click.option('--eps-end', type=float, default=0.1, help='final exploration epsilon')
 @click.option('--eps-decay', type=int, default=250_000, help='final exploration epsilon')
-@click.option('--gamma', type=float, default=0.999, help='discount factor')
+@click.option('--gamma', type=float, default=0.98, help='discount factor')
 @click.option('--group', type=str)
 @click.option('--log-frequency', type=int, default=5e1, help='logging frequency, episodes')
-@click.option('--learning-rate', type=float, default=1e-1, help='goal learning rate')
+@click.option('--learning-rate', type=float, default=0.00025, help='goal learning rate')
 @click.option('--note', type=str, help='message to explain how is this run different')
-@click.option('--normalize-obs/--not-normalize-obs', default=None, required=True, help='whether to normalize agent observations')
 @click.option('--seed', type=int, default=42, help='random seed used')
 @click.option('--target-freq', type=int, default=2000, help='how frequently to update target network')
 @click.option('--update-freq', type=int, default=1, help='how frequently to run optimization')
@@ -152,7 +109,7 @@ def train(batch_size, buffer_size, buffer_prefill_steps,
           env_name, episodes, eps_start, eps_end, eps_decay,
           gamma, group,
           log_frequency, learning_rate,
-          note, normalize_obs,
+          note,
           seed,
           target_freq,
           update_freq, use_wandb):
@@ -178,7 +135,6 @@ def train(batch_size, buffer_size, buffer_prefill_steps,
                    gamma=gamma,
                    learning_rate=learning_rate,
                    log_frequency=log_frequency,
-                   normalize_obs=normalize_obs,
                    seed=seed,
                    target_freq=target_freq,
                    update_freq=update_freq,
@@ -207,7 +163,7 @@ def train(batch_size, buffer_size, buffer_prefill_steps,
                            eps_end=eps_end, eps_decay=eps_decay, update_interval=update_freq,
                            target_update=target_freq, env=env, update_start=buffer_prefill_steps)
 
-    run_training(episodes, agent, env, observation_shape, agent_save_dir, log_frequency, normalize=normalize_obs)
+    run_training(episodes, agent, env, observation_shape, agent_save_dir, log_frequency)
 
     env.close()
     wandb.finish()
