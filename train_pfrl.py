@@ -51,7 +51,7 @@ def compute_obs_normalization(episodes, env, obs_shape, save_dir):
     return mean, std
 
 
-def run_training(episodes, actor, env, obs_shape, save_path, log_frequency, log_prefix='', gifs=False, normalize=False):
+def run_training(episodes, agent, env, obs_shape, save_path, log_frequency, log_prefix='', gifs=False, normalize=False):
     '''Run training of a DQN PFRL agent with SECRET attention model and custom reward redistribution.'''
 
     frames = []
@@ -67,9 +67,12 @@ def run_training(episodes, actor, env, obs_shape, save_path, log_frequency, log_
     os.makedirs(best_agent_dir, exist_ok=True)
     os.makedirs(final_agent_dir, exist_ok=True)
 
-    obs_mean, obs_std = compute_obs_normalization(100, env, obs_shape, save_path)
-    obs_mean_np = obs_mean.numpy()
-    obs_std_np = obs_std.numpy()
+    if normalize:
+        obs_mean, obs_std = compute_obs_normalization(100, env, obs_shape, save_path)
+        obs_mean_np = obs_mean.numpy()
+        obs_std_np = obs_std.numpy()
+
+    actor = agent.agent
 
     with Xvfb():
         for i_episode in tqdm(range(1, episodes+1), mininterval=0.5):
@@ -130,7 +133,7 @@ def run_training(episodes, actor, env, obs_shape, save_path, log_frequency, log_
 @click.option('--batch-size', default=32, help='training batch size')
 @click.option('--buffer-size', default=5e4, type=int, help='size of the replay buffer')
 @click.option('--buffer-prefill-steps', default=5e3, type=int, help='size of the prefilled replay buffer')
-@click.option('--env-name', type=str, default='MiniGrid-Triggers-3x3-v0')
+@click.option('--env-name', type=str, default='MiniGrid-Triggers-3x3-T1P1-v0')
 @click.option('--episodes', type=int, help='number of episodes to train for', required=True)
 @click.option('--eps-start', type=float, default=1, help='starting exploration epsilon')
 @click.option('--eps-end', type=float, default=0.1, help='final exploration epsilon')
@@ -164,18 +167,19 @@ def train(batch_size, buffer_size, buffer_prefill_steps,
                notes=note,
                mode='online' if use_wandb else 'disabled',
                config=dict(
-                   env_name=env_name,
-                   seed=seed,
-                   log_frequency=log_frequency,
-                   episodes=episodes,
-                   learning_rate=learning_rate,
-                   gamma=gamma,
-                   eps_start=eps_start,
-                   eps_end=eps_end,
-                   eps_decay=eps_decay,
-                   buffer_size=buffer_size,
-                   buffer_prefill_steps=buffer_prefill_steps,
                    batch_size=batch_size,
+                   buffer_prefill_steps=buffer_prefill_steps,
+                   buffer_size=buffer_size,
+                   env_name=env_name,
+                   episodes=episodes,
+                   eps_decay=eps_decay,
+                   eps_end=eps_end,
+                   eps_start=eps_start,
+                   gamma=gamma,
+                   learning_rate=learning_rate,
+                   log_frequency=log_frequency,
+                   normalize_obs=normalize_obs,
+                   seed=seed,
                    target_freq=target_freq,
                    update_freq=update_freq,
                ))
@@ -197,13 +201,13 @@ def train(batch_size, buffer_size, buffer_prefill_steps,
         env = ImgObsWrapper(RGBImgObsWrapper(env))
 
     observation_shape = env.reset().shape
-    actor = DQN_PFRL_ACTOR(*observation_shape, env.action_space.n,
+    agent = DQN_PFRL_ACTOR(*observation_shape, env.action_space.n,
                            learning_rate=learning_rate, buffer_size=buffer_size,
                            gamma=gamma, batch_size=batch_size, eps_start=eps_start,
                            eps_end=eps_end, eps_decay=eps_decay, update_interval=update_freq,
-                           target_update=target_freq, env=env, update_start=buffer_prefill_steps).agent
+                           target_update=target_freq, env=env, update_start=buffer_prefill_steps)
 
-    run_training(episodes, actor, env, observation_shape, agent_save_dir, log_frequency, normalize=normalize_obs)
+    run_training(episodes, agent, env, observation_shape, agent_save_dir, log_frequency, normalize=normalize_obs)
 
     env.close()
     wandb.finish()
