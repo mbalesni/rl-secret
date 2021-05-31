@@ -7,6 +7,7 @@ import os
 import random
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 import gc
+from scipy.interpolate import interp1d
 
 import wandb
 from timing import Timing
@@ -15,7 +16,7 @@ import matplotlib.pyplot as plt
 
 from reward_predictor import RewardPredictor
 from trajectories import preprocess_dataset, find_activations
-from config import PAD_VAL
+from config import PAD_VAL, SEQ_LEN
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -43,7 +44,27 @@ def run_ca_evaluation(model_path, data_path,
     trigger_activations = find_activations(dataset.observations, dataset.actions, target='trigger').to(device)  # N, S
     prize_activations = find_activations(dataset.observations, dataset.actions, target='prize')  # N, S
 
-    trigger_activations_indices = torch.argmax(trigger_activations, axis=-1).to(device)  # (N,) timesteps preceding trigger activation
+    trigger_timesteps_list = [torch.nonzero(act).reshape(-1) for act in trigger_activations]
+    filler = np.arange(0, SEQ_LEN)
+    trigger_timesteps = torch.empty_like(trigger_activations)
+    for i, episode_triggers in enumerate(trigger_timesteps_list):
+
+        if len(episode_triggers) > 1:
+            # several triggers
+
+            closest_triggers = interpolator(episode_triggers.cpu(), filler)  # fill with 0s if no triggers?
+            closest_triggers = torch.tensor(closest_triggers, dtype=torch.int8, device=device)
+        elif len(episode_triggers) == 1:
+            # single trigger
+
+            closest_triggers = torch.zeros((SEQ_LEN), dtype=torch.int8, device=device) + episode_triggers
+        else:
+            # no triggers
+
+            closest_triggers = torch.zeros((SEQ_LEN), dtype=torch.int8, device=device)
+
+        trigger_timesteps[i] = closest_triggers
+
     prize_activations_indices = torch.argmax(prize_activations, axis=-1)  # (N,) timesteps preceding taking prize
 
     episodes_with_prize_mask = torch.sum(prize_activations, axis=-1).to(device)  # mask for episodes where prizes were taken
@@ -56,7 +77,7 @@ def run_ca_evaluation(model_path, data_path,
         'episodes_with_prize_mask': episodes_with_prize_mask,
         'seq_len': seq_len,
         'trigger_activations': trigger_activations,
-        'trigger_timesteps': trigger_activations_indices,
+        'trigger_timesteps': trigger_timesteps,
         'prize_activations': prize_activations,
         'prize_timesteps': prize_activations_indices,
     }
@@ -160,13 +181,18 @@ def forward_batch(model, criterion, batch, device, timing, ca_gt, skip_no_trigge
         attention_vals *= prize_episodes_mask_batch[:, None]
 
         # compute relative timesteps for each episode relative to trigger activation
-        # e.g.
-        # [[-10, -9, -8, ..., 39],
-        # [-25, -24, -24,..., 24],
-        #                     ...]
+        # e.g. if trigger = 10
+        # rel_timesteps = [-10, -9, -8, ..., 39]
+        #
+        # also works for several triggers, e.g. if triggers == [6, 7, 17]
+        # rel_timesteps = (without adding `seq_len`):
+        # [-6, -5, -4, -3, -2, -1,  0,  0,  1,  2,  3,  4,  5, -4, -3, -2, -1,  0,
+        #   1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+        #   19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]
+        #
         rel_timesteps = torch.arange(0, seq_len) + seq_len
         rel_timesteps = rel_timesteps.repeat(N, 1).to(device)
-        rel_timesteps -= trigger_timesteps_batch[:, None]
+        rel_timesteps -= trigger_timesteps_batch
 
         # scatter the batch's attention values over a relative timestep matrix (N, S*2+1)
         n_episodes_prizes_and_triggers = torch.sum(torch.logical_and(prize_episodes_mask_batch, trigger_episodes_mask_batch))
@@ -246,6 +272,10 @@ def evaluate(model, criterion, data_loader, device, timing, ca_gt, ca_skip_episo
     return mean_loss, mean_acc, mean_ca_precision, mean_ca_recall, mean_rel_attention_vals, y_preds, y_trues
 
 
+def interpolator(values, filler):
+    return interp1d(values, values, kind='nearest', fill_value='extrapolate')(filler)
+
+
 @click.command()
 @click.option('--agent', type=str, required=True)
 @click.option('--group', type=str, required=True)
@@ -281,7 +311,27 @@ def train(agent, group, note, data_path, test_path, seed, seeds, log_frequency,
         trigger_activations = find_activations(dataset.observations, dataset.actions, target='trigger').to(device)  # (N, S)
         prize_activations = find_activations(dataset.observations, dataset.actions, target='prize')  # (N, S)
 
-        trigger_timesteps = torch.argmax(trigger_activations, axis=-1).to(device)  # (N,)
+        trigger_timesteps_list = [torch.nonzero(act).reshape(-1) for act in trigger_activations]
+        filler = np.arange(0, SEQ_LEN)
+        trigger_timesteps = torch.empty_like(trigger_activations)
+        for i, episode_triggers in enumerate(trigger_timesteps_list):
+
+            if len(episode_triggers) > 1:
+                # several triggers
+
+                closest_triggers = interpolator(episode_triggers.cpu(), filler)  # fill with 0s if no triggers?
+                closest_triggers = torch.tensor(closest_triggers, dtype=torch.int8, device=device)
+            elif len(episode_triggers) == 1:
+                # single trigger
+
+                closest_triggers = torch.zeros((SEQ_LEN), dtype=torch.int8, device=device) + episode_triggers
+            else:
+                # no triggers
+
+                closest_triggers = torch.zeros((SEQ_LEN), dtype=torch.int8, device=device)
+
+            trigger_timesteps[i] = closest_triggers
+
         prize_timesteps = torch.argmax(prize_activations, axis=-1)  # (N,)
 
         # episode binary masks where prizes/triggers were taken
