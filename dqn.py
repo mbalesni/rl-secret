@@ -24,6 +24,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 Transition = namedtuple('Transition',
                         ('state', 'action', 'next_state', 'reward'))
 
+
 class ReplayMemory(object):
 
     def __init__(self, capacity):
@@ -44,6 +45,7 @@ class ReplayMemory(object):
     def __len__(self):
         return len(self.memory)
 
+
 class DQN(nn.Module):
 
     def __init__(self, h, w, outputs):
@@ -57,8 +59,8 @@ class DQN(nn.Module):
 
         # Number of Linear input connections depends on output of conv2d layers
         # and therefore the input image size, so compute it.
-        def conv2d_size_out(size, kernel_size = 3, stride = 1):
-            return (size - (kernel_size - 1) - 1) // stride  + 1
+        def conv2d_size_out(size, kernel_size=3, stride=1):
+            return (size - (kernel_size - 1) - 1) // stride + 1
         convw = conv2d_size_out(conv2d_size_out(conv2d_size_out(w, stride=2)))
         convh = conv2d_size_out(conv2d_size_out(conv2d_size_out(h, stride=2)))
         linear_input_size = convw * convh * 16
@@ -72,6 +74,7 @@ class DQN(nn.Module):
         x = F.relu(self.bn2(self.conv2(x)))
         x = F.relu(self.bn3(self.conv3(x)))
         return self.head(x.reshape(x.size(0), -1))
+
 
 class RandomActor:
 
@@ -115,7 +118,7 @@ class RandomActor:
 class DQNActor:
 
     def __init__(self, screen_height, screen_width, n_channels, n_actions, eps_start=1,
-                 eps_end=0.01, eps_test=0.001, eps_decay=250_000, eps_const=None, gamma=0.999, 
+                 eps_end=0.01, eps_test=0.001, eps_decay=250_000, eps_const=None, gamma=0.999,
                  batch_size=32, target_update=2000, learning_rate=0.00025, buffer_size=1_000_000):
         self.n_actions = n_actions
         self.gamma = gamma
@@ -153,7 +156,7 @@ class DQNActor:
             eps_threshold = self.eps_const
         else:
             eps_threshold = self.eps_start - self.steps_done * (self.eps_start - self.eps_end) / self.eps_decay
-            eps_threshold = max(self.eps_end, eps_threshold) # make sure we don't go lower than eps_endd
+            eps_threshold = max(self.eps_end, eps_threshold)  # make sure we don't go lower than eps_endd
         self.eps_threshold = eps_threshold
         self.steps_done += 1
         if sample > eps_threshold:
@@ -178,18 +181,16 @@ class DQNActor:
         # to Transition of batch-arrays.
         batch = Transition(*zip(*transitions))
 
-
         # Compute a mask of non-final states and concatenate the batch elements
         # (a final state would've been the one after which simulation ended)
         non_final_mask = torch.tensor(tuple(map(lambda s: s is not None,
-                                            batch.next_state)), device=device, dtype=torch.bool)
+                                                batch.next_state)), device=device, dtype=torch.bool)
         non_final_next_states = torch.cat([s for s in batch.next_state
-                                                    if s is not None])
+                                           if s is not None])
 
         state_batch = torch.cat(batch.state)
         action_batch = torch.cat(batch.action)
         reward_batch = torch.cat(batch.reward)
-
 
         # Compute Q(s_t, a) - the model computes Q(s_t), then we select the
         # columns of actions taken. These are the actions which would've been taken
@@ -245,10 +246,8 @@ class DQNActor:
         self.memory.push(self.last_observation, action, next_state, reward)
         self.last_observation = observation
 
-
         # Perform one step of the optimization (on the target network)
         with Timing(timing, 'time_optimize_model'):
             self.optimize_model(i_episode)
 
         return raw_observation, reward, done, info, action
-

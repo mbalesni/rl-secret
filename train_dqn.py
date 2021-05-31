@@ -140,7 +140,7 @@ def train(note, env_name, seed, log_frequency, episodes,
                 observation = env.reset()
                 if record_random:
                     recording['episodes'].append([])
-                actor.new_episode(observation)
+                random_actor.new_episode(observation)
 
                 if i_episode > 1 and (i_episode % log_frequency) == 0:
                     wandb.log({

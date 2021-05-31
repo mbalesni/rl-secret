@@ -9,7 +9,7 @@ from xvfbwrapper import Xvfb
 import wandb
 from itertools import count
 
-from gym_minigrid.wrappers import RGBImgObsWrapper
+from gym_minigrid.wrappers import RGBImgBothObsWrapper
 from tqdm import tqdm
 from trajectories import TrajectoriesRecorder, StatefullTrajectoriesRecorder
 
@@ -111,7 +111,7 @@ def run(note, env_name, env_label, episodes, gifs, part_observ, both_observ, see
     random.seed(seed)
 
     env = gym.make(env_name)
-    env = RGBImgObsWrapper(env)
+    env = RGBImgBothObsWrapper(env)
 
     observation = env.reset()
     part_obs_key = 'image_partial'
@@ -128,7 +128,7 @@ def run(note, env_name, env_label, episodes, gifs, part_observ, both_observ, see
     wandb.login()
     wandb.init(entity='ut-rl-credit',
                project='attentional_fw_baselines',
-               tags=['SECRET', 'verification'],
+               tags=['exploration'],
                notes=note or 'Collect trajectories with random policy ',
                mode='online' if use_wandb else 'disabled',
                config=dict(
