@@ -4,7 +4,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from config import PAD_VAL
+from secret.src.config import PAD_VAL
 
 
 class TransformerEncoderCustom(nn.TransformerEncoderLayer):

@@ -1,10 +1,10 @@
 # runs
-agents
 nohup.out
 gifs
 logs
 recordings
 wandb
+data
 
 # Python/vscode
 .vscode

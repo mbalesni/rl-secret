@@ -1,15 +1,8 @@
 # adopted from https://pytorch.org/tutorials/intermediate/reinforcement_q_learning.html
 
-import os
-import math
 import random
 import numpy as np
-import matplotlib
-import matplotlib.pyplot as plt
 from collections import namedtuple
-from itertools import count
-from PIL import Image
-import sys
 
 import torch
 import torch.nn as nn
@@ -17,7 +10,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 import wandb
 
-from timing import Timing
+from secret.src.timing import Timing
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 

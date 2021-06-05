@@ -64,8 +64,7 @@ class PolicyPPO(torch.nn.Module):
 
 
 def PPO_PFRL_ACTOR(screen_height, screen_width, n_channels, n_actions, gamma=0.99, batch_size=32, update_interval=1024,
-                   learning_rate=0.00025, learning_rate_decay_steps=1e7, epochs=10, clip_eps=0.2, entropy_coef=0.01,
-                   env=None):
+                   learning_rate=0.00025, learning_rate_decay_steps=1e7, epochs=10, clip_eps=0.2, entropy_coef=0.01):
     policy = PolicyPPO(screen_height, screen_width, n_channels, n_actions)
     optimizer = optim.Adam(policy.model.parameters(), lr=learning_rate, eps=1e-8)
 

@@ -14,7 +14,7 @@ from itertools import count
 from tqdm import tqdm
 
 from gym_minigrid.wrappers import ImgObsWrapper, RGBImgPartialObsWrapper, RGBImgObsWrapper
-from dqn import DQNActor, RandomActor
+from secret.src.agents.dqn import DQNActor, RandomActor
 
 
 recording = {

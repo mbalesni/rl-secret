@@ -5,23 +5,26 @@ import click
 import os
 import random
 from xvfbwrapper import Xvfb
+from collections import deque
 
 import wandb
 from itertools import count
-from timing import Timing
+from secret.src.timing import Timing
 from tqdm import tqdm
 # import matplotlib.pyplot as plt
 # import time
 
 from gym_minigrid.wrappers import RGBImgBothObsWrapper
-from config import PAD_VAL, SEQ_LEN, ACTION_SIZE, ATTN_THRESHOLD
-from trajectories import one_hot_encode_action
-from ppo_pfrl import PPO_PFRL_ACTOR
+from secret.src.config import PAD_VAL, ATTN_THRESHOLD
+from secret.envs.triggers.utils import one_hot_encode_action
+from secret.src.agents.ppo_pfrl import PPO_PFRL_ACTOR
 
 # from pfrl.experiments.hooks import StepHook
-from pfrl import experiments
+import pfrl
+from pfrl import experiments, utils
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+SEQ_LEN = 50
 
 
 def frames_to_video(frames, fps=15):
@@ -126,9 +129,162 @@ def redistribute_reward(agent, final_step, reward_steps, trigger_steps_gt,
     # print('done saving')
 
 
+def collate_batch_obs(obss):
+    collated_dict = {
+        'image': np.zeros((len(obss), *obss[0]['image'].shape)),
+        'image_partial': np.zeros((len(obss), *obss[0]['image_partial'].shape)),
+    }
+
+    for i, obs in enumerate(obss):
+        collated_dict['image'][i] = obs['image']
+        collated_dict['image_partial'][i] = obs['image_partial']
+
+    return collated_dict
+
+
+# TODO: monitoring (gifs)
+def run_training_batch(
+    episodes,
+    agent,
+    env,
+    outdir,
+    log_frequency=None,
+    learning_rate=None,
+    learning_rate_decay_steps=None,
+    use_redistributed_reward=False,
+    ca_model=None,
+    log_prefix='',
+    gifs=False,
+    logs_window_size=100,
+):
+    """Train an agent in a batch environment.
+    Args:
+        agent: Agent to train.
+        env: Environment to train the agent against.
+        steps (int): Number of total time steps for training.
+        outdir (str): Path to the directory to output things.
+        checkpoint_freq (int): frequency at which agents are stored.
+        log_frequency (int): Interval of logging.
+        return_window_size (int): Number of training episodes used to estimate
+            the average returns of the current agent.
+        successful_score (float): Finish training if the mean score is greater
+            or equal to thisvalue if not None
+        step_hooks (Sequence): Sequence of callable objects that accepts
+            (env, agent, step) as arguments. They are called every step.
+            See pfrl.experiments.hooks.
+        logger (logging.Logger): Logger used in this function.
+    Returns:
+        List of evaluation episode stats dict.
+    """
+
+    timing = dict()
+
+    best_return = -999999
+    best_agent_dir = os.path.join(outdir, 'best_agent')
+    final_agent_dir = os.path.join(outdir, 'final_agent')
+    os.makedirs(best_agent_dir, exist_ok=True)
+    os.makedirs(final_agent_dir, exist_ok=True)
+
+    recent_returns = deque(maxlen=logs_window_size)
+    recent_durations = deque(maxlen=logs_window_size)
+
+    lr_scheduler = experiments.LinearInterpolationHook(learning_rate_decay_steps, learning_rate, 0, lr_setter)
+    global_timestep = 0
+
+    num_envs = env.num_envs
+    episode_r = np.zeros(num_envs, dtype=np.float64)
+    episode_idx = np.zeros(num_envs, dtype="i")
+    episode_len = np.zeros(num_envs, dtype="i")
+
+    # o_0, r_0
+    obss = collate_batch_obs(env.reset())
+
+    with Xvfb():
+        while True:
+            # last_obss = obss['image_partial']
+
+            # a_t
+            with Timing(timing, 'time_choose_act'):
+                actions = agent.batch_act(obss['image'])
+            # o_{t+1}, r_{t+1}
+            with Timing(timing, 'time_perform_act'):
+                obss, rs, dones, _ = env.step(actions)
+                obss = collate_batch_obs(obss)
+                dones = np.array(dones)
+
+            for rew in rs:
+                if rew < 0:
+                    print('got neg rew!')
+                elif rew > 1:
+                    print('got pos rew')
+            episode_r += rs
+            episode_len += 1
+
+            # Compute mask for done and reset
+            resets = np.zeros(num_envs, dtype=bool)
+            # Agent observes the consequences
+            with Timing(timing, 'time_observe'):
+                agent.batch_observe(obss['image'], rs, dones, resets)
+                lr_scheduler(env, agent, global_timestep)
+
+            # Make mask. 0 if done/reset, 1 if pass
+            not_end = np.logical_not(dones)
+
+            # For episodes that ends, do the following:
+            #   1. increment the episode count
+            #   2. record the return
+            #   3. clear the record of rewards
+            #   4. clear the record of the number of steps
+            #   5. reset the env to start a new episode
+            # 3-5 are skipped when training is already finished.
+            # print('Finished episodes mask:', dones)
+            episode_idx += dones
+            # if len(episode_r[dones]) > 0:
+            #     print('Saving rewards for finished episodes:', episode_r[dones])
+            recent_returns.extend(episode_r[dones])
+            # print('Saving durations for finished episodes:', episode_len[dones])
+            recent_durations.extend(episode_len[dones])
+            global_timestep += num_envs
+
+            if (
+                log_frequency is not None
+                and np.sum(episode_idx) >= log_frequency
+                and np.sum(episode_idx) % log_frequency < num_envs
+            ):
+                avg_duration = np.mean(recent_durations) if recent_durations else np.nan
+                avg_return = np.mean(recent_returns) if recent_returns else np.nan
+                agent_stats = agent.get_statistics()
+
+                wandb_payload = ({
+                    f'{log_prefix}avg_episode_duration': avg_duration,
+                    f'{log_prefix}avg_episode_return': avg_return,
+                    f'{log_prefix}episode': np.sum(episode_idx),
+                    **{f'{log_prefix}{k}': v['time'] / v['count'] for k, v in timing.items()},
+                    **{f'{log_prefix}ppo_{k}': v for k, v in agent_stats},
+                })
+                wandb.log(wandb_payload)
+                timing = dict()
+
+                if avg_return > best_return:
+                    best_return = avg_return
+                    agent.save(best_agent_dir)
+
+            if np.sum(episode_idx) >= episodes:
+                print(f'done with {episodes} episodes:', episode_idx)
+                break
+
+            # Start new episodes if needed
+            episode_r[dones] = 0
+            episode_len[dones] = 0
+
+            obss = collate_batch_obs(env.reset(not_end))
+
+        env.close()
+
+
 def run_training(episodes, agent, env, obs_shape, save_path, log_frequency, learning_rate=None,
                  learning_rate_decay_steps=None, use_redistributed_reward=False, ca_model=None, log_prefix='', gifs=False):
-    '''Run training of a PPO PFRL agent with SECRET attention model and custom reward redistribution.'''
+    '''Run training of a PPO PFRL agent. Optionally with SECRET.'''
 
     frames = []
     logs = {
@@ -145,6 +301,7 @@ def run_training(episodes, agent, env, obs_shape, save_path, log_frequency, lear
 
     lr_scheduler = experiments.LinearInterpolationHook(learning_rate_decay_steps, learning_rate, 0, lr_setter)
     global_timestep = 0
+    ACTION_SIZE = env.action_space.n
 
     with Xvfb():
         for i_episode in tqdm(range(1, episodes+1), mininterval=0.5):
@@ -236,20 +393,21 @@ def lr_setter(env, agent, value):
 
 
 @click.command()
-@click.option('--batch-size', default=32, help='training batch size')
+@click.option('--batch-size', default=128, help='training batch size')
 @click.option('--ca-model-path', type=click.Path(exists=True), help='path to a creadit assignment model for reward redistribution')
 @click.option('--clip-eps', type=float, default=0.2, help='epsilon clipping')
 @click.option('--entropy-coef', type=float, default=0.01, help='weight for ppo entropy loss term')
 @click.option('--env-name', type=str, default='MiniGrid-Triggers-3x3-T1P1-v0')
 @click.option('--episodes', type=int, help='number of episodes to train for', required=True)
-@click.option('--epochs', type=int, default=10, help='epochs to run a PPO training iteration for')
-@click.option('--gamma', type=float, default=0.98, help='discount factor')
+@click.option('--epochs', type=int, default=4, help='epochs to run a PPO training iteration for')
+@click.option('--gamma', type=float, default=0.99, help='discount factor')
 @click.option('--gifs/--no-gifs', default=False, help='whether to save some episodes as gifs to W&B')
 @click.option('--group', type=str)
 @click.option('--log-frequency', type=int, default=5e1, help='logging frequency, episodes')
-@click.option('--learning-rate', type=float, default=0.00025, help='goal learning rate')
+@click.option('--learning-rate', type=float, default=0.001, help='goal learning rate')
 @click.option('--learning-rate-decay', type=int, default=1e7, help='steps to decay lr to 0')
 @click.option('--note', type=str, help='message to explain how is this run different')
+@click.option('--num-workers', type=int, default=10, help='number of parallel ppo environments')
 @click.option('--seed', type=int, default=42, help='random seed used')
 @click.option('--update-freq', type=int, default=1024, help='how frequently to run optimization')
 @click.option('--use-wandb/--no-wandb', default=True)
@@ -259,7 +417,7 @@ def main(batch_size,
          entropy_coef, env_name, episodes, epochs,
          gamma, gifs, group,
          log_frequency, learning_rate, learning_rate_decay,
-         note,
+         note, num_workers,
          seed,
          update_freq, use_wandb, use_redistributed_reward):
 
@@ -291,6 +449,7 @@ def main(batch_size,
                    learning_rate=learning_rate,
                    learning_rate_decay=learning_rate_decay,
                    log_frequency=log_frequency,
+                   num_workers=num_workers,
                    seed=seed,
                    update_freq=update_freq,
                    use_redistributed_reward=use_redistributed_reward,
@@ -308,26 +467,62 @@ def main(batch_size,
     np.random.seed(seed)
     random.seed(seed)
 
-    env = gym.make(env_name)
-    if 'MiniGrid' in env_name:  # support non-MiniGrid environments
-        env = RGBImgBothObsWrapper(env)
+    # pfrl
 
-    observation_obj = env.reset()
-    observation_shape = observation_obj['image'].shape
-    agent = PPO_PFRL_ACTOR(*observation_shape, env.action_space.n,
+    # Set a random seed used in PFRL.
+    utils.set_random_seed(seed)
+
+    # Set different random seeds for different subprocesses.
+    # If seed=0 and processes=4, subprocess seeds are [0, 1, 2, 3].
+    # If seed=1 and processes=4, subprocess seeds are [4, 5, 6, 7].
+    process_seeds = np.arange(num_workers) + seed * num_workers
+    assert process_seeds.max() < 2 ** 32
+
+    def make_env(idx, test):
+        # Use different random seeds for train and test envs
+        process_seed = int(process_seeds[idx])
+        env_seed = 2 ** 32 - 1 - process_seed if test else process_seed
+        env = gym.make(env_name)
+        if 'MiniGrid' in env_name:  # support non-MiniGrid environments
+            env = RGBImgBothObsWrapper(env)
+        env.seed(env_seed)
+        # if args.monitor:
+        #     env = pfrl.wrappers.Monitor(
+        #         env, args.outdir, mode="evaluation" if test else "training"
+        #     )
+        return env
+
+    def make_batch_env(test):
+        vec_env = pfrl.envs.MultiprocessVectorEnv(
+            [
+                (lambda: make_env(idx, test))
+                for idx, _ in enumerate(range(num_workers))
+            ]
+        )
+        # if not args.no_frame_stack:
+        #     vec_env = pfrl.wrappers.VectorFrameStack(vec_env, 4)
+        return vec_env
+
+    sample_env = make_batch_env(test=False)
+    print("Observation space", sample_env.observation_space)
+    print("Action space", sample_env.action_space)
+    n_actions = sample_env.action_space.n
+    obs_space = sample_env.observation_space['image'].shape
+    del sample_env
+
+    agent = PPO_PFRL_ACTOR(*obs_space, n_actions,
                            learning_rate=learning_rate, learning_rate_decay_steps=learning_rate_decay,
                            gamma=gamma, batch_size=batch_size,
-                           update_interval=update_freq, entropy_coef=entropy_coef, env=env, epochs=epochs)
+                           update_interval=update_freq, entropy_coef=entropy_coef, epochs=epochs)
 
     ca_model = None
 
     if ca_model_path:
         ca_model = torch.load(ca_model_path).to(device)
 
-    run_training(episodes, agent, env, observation_shape, agent_save_dir, log_frequency, use_redistributed_reward=use_redistributed_reward,
-                 learning_rate=learning_rate, learning_rate_decay_steps=learning_rate_decay, ca_model=ca_model, gifs=gifs)
+    run_training_batch(episodes, agent, make_batch_env(test=False), agent_save_dir, log_frequency, use_redistributed_reward=use_redistributed_reward,
+                       learning_rate=learning_rate, learning_rate_decay_steps=learning_rate_decay, ca_model=ca_model, gifs=gifs)
 
-    env.close()
     wandb.finish()
 
 

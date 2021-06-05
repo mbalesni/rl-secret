@@ -9,12 +9,12 @@ from xvfbwrapper import Xvfb
 
 import wandb
 from itertools import count
-from timing import Timing
+from secret.src.timing import Timing
 
 from gym_minigrid.wrappers import RGBImgObsWrapper
-from dqn_pfrl import DQN_PFRL_ACTOR
+from secret.src.agents.dqn_pfrl import DQN_PFRL_ACTOR
 from tqdm import tqdm
-from trajectories import save_trajectories
+from secret.envs.triggers.utils import save_trajectories
 
 trajectories = []
 test_trajectories = []

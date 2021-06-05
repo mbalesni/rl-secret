@@ -8,17 +8,18 @@ from xvfbwrapper import Xvfb
 
 import wandb
 from itertools import count
-from timing import Timing
+from secret.src.timing import Timing
 from tqdm import tqdm
 # import matplotlib.pyplot as plt
 # import time
 
 from gym_minigrid.wrappers import RGBImgBothObsWrapper
-from dqn_pfrl import DQN_PFRL_ACTOR
-from config import PAD_VAL, SEQ_LEN, ACTION_SIZE, ATTN_THRESHOLD
-from trajectories import one_hot_encode_action
+from secret.src.agents.dqn_pfrl import DQN_PFRL_ACTOR
+from secret.src.config import PAD_VAL, ATTN_THRESHOLD
+from secret.envs.triggers.utils import one_hot_encode_action
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+SEQ_LEN = 50
 
 
 def frames_to_video(frames, fps=15):
@@ -138,6 +139,7 @@ def run_training(episodes, agent, env, obs_shape, save_path, log_frequency, use_
     final_agent_dir = os.path.join(save_path, 'final_agent')
     os.makedirs(best_agent_dir, exist_ok=True)
     os.makedirs(final_agent_dir, exist_ok=True)
+    ACTION_SIZE = env.action_space.n
 
     actor = agent.agent
 

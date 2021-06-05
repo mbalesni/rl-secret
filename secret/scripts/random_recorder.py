@@ -11,7 +11,7 @@ from itertools import count
 
 from gym_minigrid.wrappers import RGBImgBothObsWrapper
 from tqdm import tqdm
-from trajectories import TrajectoriesRecorder, StatefullTrajectoriesRecorder
+from secret.envs.triggers.utils import TrajectoriesRecorder, StatefullTrajectoriesRecorder
 
 
 def frames_to_video(frames, fps=15):
