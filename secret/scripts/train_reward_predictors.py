@@ -9,16 +9,21 @@ from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 from scipy.interpolate import interp1d
 
 import os
+import sys
 import gc
 import wandb
 from tqdm import tqdm
 
 from secret.src.timing import Timing
 from secret.src.reward_predictor import RewardPredictor
-from secret.envs.triggers.utils import preprocess_dataset, find_activations
+from secret.envs.triggers.trajectories import preprocess_dataset, find_activations
 from secret.src.config import PAD_VAL
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+trajectories_module_path = '../envs/triggers'
+if trajectories_module_path not in sys.path:
+    sys.path.append(trajectories_module_path)
 
 
 def run_ca_evaluation(model_path, data_path,

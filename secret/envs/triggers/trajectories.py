@@ -5,7 +5,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader, random_split
 from torch.nn.functional import one_hot
 
-from config import PAD_VAL
+from secret.src.config import PAD_VAL
 
 
 class TrajectoriesDataset(Dataset):

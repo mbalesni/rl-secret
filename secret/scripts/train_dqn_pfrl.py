@@ -16,7 +16,7 @@ from tqdm import tqdm
 from gym_minigrid.wrappers import RGBImgBothObsWrapper
 from secret.src.agents.dqn_pfrl import DQN_PFRL_ACTOR
 from secret.src.config import PAD_VAL, ATTN_THRESHOLD
-from secret.envs.triggers.utils import one_hot_encode_action
+from secret.envs.triggers.trajectories import one_hot_encode_action
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 SEQ_LEN = 50
@@ -61,6 +61,7 @@ def redistribute_reward(agent, final_step, reward_steps, trigger_steps_gt,
 
     # print()
     # print('Final step:', final_step)
+    total_redistributed = 0
 
     if ca_model:
 
@@ -79,6 +80,7 @@ def redistribute_reward(agent, final_step, reward_steps, trigger_steps_gt,
         # and to each causal step
         # add the reward
         for reward_step in reward_steps:
+            print('Applying reshaping!')
             reward_mem_idx = reward_step - final_step - 1
             memory = memories[reward_mem_idx][0]
             reward = memory['reward']
@@ -86,11 +88,14 @@ def redistribute_reward(agent, final_step, reward_steps, trigger_steps_gt,
 
             # redistribute only if prediction is correct
             if reward != pred_reward:
+                print('Wrong prediction — not continuing with reshaping.')
                 continue
 
             attention_vals = attention_output[0, reward_step]
             attention_discrete = torch.gt(attention_vals, ATTN_THRESHOLD, out=torch.empty(attention_vals.shape, dtype=torch.uint8, device=device))
             causal_steps = torch.where(attention_discrete == 1)[0]
+
+            print(f'Found {len(causal_steps)} causal steps.')
 
             for causal_step in causal_steps:
                 causal_mem_idx = causal_step - final_step - 1
@@ -100,7 +105,8 @@ def redistribute_reward(agent, final_step, reward_steps, trigger_steps_gt,
                 # plt.close()
 
                 memories[causal_mem_idx][0]['reward'] += reward
-
+                total_redistributed += reward
+                print(f'Adding {reward} to reward.')
     else:
         for reward_step in reward_steps:
             reward_mem_idx = -(final_step - reward_step + 1)
@@ -111,7 +117,9 @@ def redistribute_reward(agent, final_step, reward_steps, trigger_steps_gt,
                 # print('trigger step:', trigger_step)
                 trigger_mem_idx_gt = -(final_step - trigger_step + 1)
                 memories[trigger_mem_idx_gt][0]['reward'] += reward
+                total_redistributed += reward
 
+    return total_redistributed
     # for i in reversed(range(1, final_step+2)):
     #     index = -i
     #     obs = memories[index][0]['state']
@@ -130,7 +138,8 @@ def run_training(episodes, agent, env, obs_shape, save_path, log_frequency, use_
     frames = []
     logs = {
         'episode_durations': [],
-        'episode_returns': []
+        'episode_returns': [],
+        'episode_redistributed_returns': [],
     }
     timing = dict()
 
@@ -196,16 +205,20 @@ def run_training(episodes, agent, env, obs_shape, save_path, log_frequency, use_
 
             if use_redistributed_reward:
                 with Timing(timing, 'time_redistribute_reward'):
-                    redistribute_reward(agent, i_step, reward_steps, trigger_steps_gt, ca_model, ca_partial_observations, ca_actions, ca_rewards)
+                    redistributed_reward = redistribute_reward(agent, i_step, reward_steps, trigger_steps_gt,
+                                                               ca_model, ca_partial_observations, ca_actions, ca_rewards)
+                    logs['episode_redistributed_returns'].append(redistributed_reward)
 
             if i_episode > 1 and (i_episode % log_frequency) == 0:
 
                 avg_duration = np.mean(logs['episode_durations'])
                 avg_return = torch.mean(torch.tensor(logs['episode_returns'], device='cpu', dtype=torch.float))
+                avg_redistributed_return = torch.mean(torch.tensor(logs['episode_redistributed_returns'], device='cpu', dtype=torch.float))
 
                 wandb_payload = ({
                     f'{log_prefix}avg_episode_duration': avg_duration,
                     f'{log_prefix}avg_episode_return': avg_return,
+                    f'{log_prefix}avg_episode_redistributed_return': avg_redistributed_return,
                     f'{log_prefix}episode': i_episode,
                     **{f'{log_prefix}{k}': v['time'] / v['count'] for k, v in timing.items()}
                 })
@@ -222,10 +235,11 @@ def run_training(episodes, agent, env, obs_shape, save_path, log_frequency, use_
 
 
 @click.command()
+@click.option('--attn-runid', help='W&B id of the attention model training run')
 @click.option('--batch-size', default=32, help='training batch size')
 @click.option('--buffer-size', default=1_000_000, type=int, help='size of the replay buffer')
 @click.option('--buffer-prefill-steps', default=5e3, type=int, help='size of the prefilled replay buffer')
-@click.option('--ca-model-path', type=click.Path(exists=True), help='path to a creadit assignment model for reward redistribution')
+@click.option('--ca-model-path', type=click.Path(exists=True), help='path to a credit assignment model for reward redistribution')
 @click.option('--env-name', type=str, default='MiniGrid-Triggers-3x3-T1P1-v0')
 @click.option('--episodes', type=int, help='number of episodes to train for', required=True)
 @click.option('--eps-start', type=float, default=1, help='starting exploration epsilon')
@@ -242,7 +256,8 @@ def run_training(episodes, agent, env, obs_shape, save_path, log_frequency, use_
 @click.option('--update-freq', type=int, default=1, help='how frequently to run optimization')
 @click.option('--use-wandb/--no-wandb', default=True)
 @click.option('--use-redistributed-reward/--vanilla', default=False, help='whether to use causal reward redistribution')
-def train(batch_size, buffer_size, buffer_prefill_steps,
+def train(attn_runid,
+          batch_size, buffer_size, buffer_prefill_steps,
           ca_model_path,
           env_name, episodes, eps_start, eps_end, eps_decay,
           gamma, gifs, group,
@@ -269,10 +284,10 @@ def train(batch_size, buffer_size, buffer_prefill_steps,
                tags=tags,
                mode='online' if use_wandb else 'disabled',
                config=dict(
+                   attn_runid=attn_runid,
                    batch_size=batch_size,
                    buffer_prefill_steps=buffer_prefill_steps,
                    buffer_size=buffer_size,
-                   ca_model_path=ca_model_path,
                    env_name=env_name,
                    episodes=episodes,
                    eps_decay=eps_decay,
@@ -293,6 +308,16 @@ def train(batch_size, buffer_size, buffer_prefill_steps,
     os.makedirs(agent_save_dir, exist_ok=True)
     wandb.save(os.path.join(save_dir, "*.pt"))
     wandb.save(os.path.join(agent_save_dir, "*.pt"))
+
+    if not ca_model_path and attn_runid:
+        print(f'Downloading the attention model from run {attn_runid}...', end=' ')
+        api = wandb.Api()
+        run = api.run(f'ut-rl-credit/attentional_fw_baselines/{attn_runid}')
+        run.file('best_model.pt').download(save_dir)
+        ca_model_path = os.path.join(save_dir, 'best_model.pt')
+        print('done!')
+
+    wandb.config['ca_model_path'] = ca_model_path
 
     torch.cuda.manual_seed(seed)
     torch.manual_seed(seed)
